@@ -293,6 +293,9 @@ static void ensure_wifi(void) {
 
 // ---------- 一次问答：录音 → 上传 → 播放 ----------
 static void show_error(const char *msg) {
+    // v0.1.9：错误页补一个听觉反馈（网络/限流类错误仍以屏幕文字为主；
+    // 「没听清请补充」的童声语音引导由服务端 X-Need-Retry 分支提供）。
+    kid_audio_beep(2);
     app_ui_set_state(KID_UI_ERROR, msg);
     wait_ok_any();
 }
@@ -334,17 +337,24 @@ static void run_ask(void) {
     }
 
     if (resp.status == 200 && resp.audio && resp.audio_len) {
+        const bool need_retry = resp.need_retry;
         // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
+        // need_retry 时服务端下发的 answer 本身就是引导语（如「我没听清楚…」），
+        // 直接显示即可；孩子听完提示音回待机，按 OK 再说一遍。
         const char *card = resp.answer_len ? resp.answer
                          : (resp.asr_len ? resp.asr : "正在读给你听~");
-        ESP_LOGI(TAG, "屏幕要点 %u 字节 / ASR %u 字节",
-                 (unsigned)resp.answer_len, (unsigned)resp.asr_len);
+        ESP_LOGI(TAG, "屏幕要点 %u 字节 / ASR %u 字节 / 需补充=%d(%s)",
+                 (unsigned)resp.answer_len, (unsigned)resp.asr_len,
+                 need_retry ? 1 : 0,
+                 resp.retry_reason[0] ? resp.retry_reason : "-");
         app_ui_set_state(KID_UI_ANSWER, card);
         kid_audio_play_ogg(resp.audio, resp.audio_len);
         LOG_MEM("play_done");
         kid_resp_free(&resp);
-        // 回待机页会清掉要点卡片，留 3 秒让孩子/家长看清屏幕文字。
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        // need_retry：播完提示音就回待机等待补充。session id 不变，下一轮 POST
+        // 会带着这一轮的引导语作为上下文，服务端据此理解孩子的补充说明。
+        // 正常答案则多留 3 秒让孩子/家长看清屏幕文字。
+        vTaskDelay(pdMS_TO_TICKS(need_retry ? 2000 : 3000));
         return;
     }
 
@@ -455,6 +465,9 @@ void app_main(void) {
     }
     if (bsp_battery_init() != ESP_OK) ESP_LOGW(TAG, "电量计不可用");
     s_input_ready = true;
+
+    // v0.1.9：一次开机生成一个会话 id，整段连续对话共用；重启即开新话题。
+    kid_net_init_session();
 
     // 16KB：本任务串行跑「录音 → libopus 编码 → HTTPS/TLS 握手 → Opus 解码播放」，
     // 8192 字节在按住 OK 进入编码时触发过 Stack protection fault（v0.1.2 实机日志）。
