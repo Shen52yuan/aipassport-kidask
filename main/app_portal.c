@@ -1,4 +1,5 @@
-// main/app_portal.c —— 见 app_portal.h。只在专用配置开机中运行，退出统一重启。
+// main/app_portal.c —— WPA2 热点 + 本地网页配网（无 PAT：KidAsk 不需要云端令牌）。
+// 每次进入通过重启隔离语音与配置任务；退出也重启，不让门户常驻语音会话。
 #include "app_portal.h"
 #include <stdio.h>
 #include <string.h>
@@ -16,8 +17,6 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "portal_form.h"
-#include "qca_api.h"
-#include "qca_pat.h"
 
 static const char *TAG = "app_portal";
 static volatile portal_stage_t s_stage;
@@ -25,10 +24,9 @@ static char s_ssid[32], s_password[13], s_token[33];
 static httpd_handle_t s_http;
 static TaskHandle_t s_worker;
 static volatile bool s_busy;
-static bool s_saved_pat_set;
 static wifi_config_t s_saved;    // 仅配置模式保存一份旧凭据，用于失败恢复
 static struct {
-    char ssid[33], pass[65], pat[QCA_PAT_MAX];
+    char ssid[33], pass[65];
     bool open;
 } s_pending;
 
@@ -42,10 +40,7 @@ const char *app_portal_text(portal_stage_t st) {
     switch (st) {
     case PORTAL_READY:          return "等待浏览器配置";
     case PORTAL_CONNECTING:     return "正在连接 Wi-Fi…";
-    case PORTAL_CHECKING:       return "正在验证 PAT…";
     case PORTAL_WIFI_FAILED:    return "连接失败，请检查网络和密码";
-    case PORTAL_PAT_FAILED:     return "PAT 无效、过期或无权限";
-    case PORTAL_SERVICE_FAILED: return "无法验证 PAT，请检查互联网";
     case PORTAL_SAVE_FAILED:    return "保存失败，请重试";
     case PORTAL_DONE:           return "配置成功，即将重启";
     case PORTAL_ERROR:          return "热点启动失败，请重启";
@@ -103,7 +98,6 @@ static esp_err_t reply(httpd_req_t *req, const char *status, const char *msg) {
     bool rejected = status[0] == '4' || status[0] == '5';
     if (rejected) httpd_resp_set_hdr(req, "Connection", "close");
     esp_err_t e = httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
-    // IDF handler 返回非 OK 会直接关闭会话，不再排空攻击者声明的大正文。
     return rejected ? ESP_FAIL : e;
 }
 static esp_err_t root_get(httpd_req_t *req) {
@@ -123,10 +117,10 @@ static esp_err_t status_get(httpd_req_t *req) {
     size_t len = strnlen((const char *)s_saved.sta.ssid, sizeof(s_saved.sta.ssid));
     form_json_escape(ssid, sizeof(ssid), (const char *)s_saved.sta.ssid, len);
     snprintf(buf, sizeof(buf),
-        "{\"stage\":%d,\"busy\":%s,\"done\":%s,\"pat_set\":%s,"
+        "{\"stage\":%d,\"busy\":%s,\"done\":%s,"
         "\"ssid\":\"%s\",\"token\":\"%s\",\"message\":\"%s\"}",
         (int)st, s_busy ? "true" : "false", st == PORTAL_DONE ? "true" : "false",
-        s_saved_pat_set ? "true" : "false", ssid, s_token, app_portal_text(st));
+        ssid, s_token, app_portal_text(st));
     no_cache(req);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -193,18 +187,14 @@ static esp_err_t save_post(httpd_req_t *req) {
     char open[2] = {0};
     bool valid = form_get(body, got, "ssid", s_pending.ssid, sizeof(s_pending.ssid)) >= 0 &&
         form_get(body, got, "pass", s_pending.pass, sizeof(s_pending.pass)) >= 0 &&
-        form_get(body, got, "pat", s_pending.pat, sizeof(s_pending.pat)) >= 0 &&
         form_get(body, got, "open", open, sizeof(open)) >= 0;
     memset(body, 0, req->content_len + 1);
     free(body);
-    form_trim(s_pending.pat);  // 密码与 SSID 的空格有意义，不修剪
     s_pending.open = strcmp(open, "1") == 0;
     if (!valid || !form_ssid_valid(s_pending.ssid) ||
-        !form_wifi_pass_valid(s_pending.pass) ||
-        (s_pending.pat[0] && !form_pat_valid(s_pending.pat, QCA_PAT_MAX - 1)) ||
-        (!s_pending.pat[0] && !qca_pat_present())) {
+        !form_wifi_pass_valid(s_pending.pass)) {
         memset(&s_pending, 0, sizeof(s_pending));
-        return reply(req, "400 Bad Request", "检查名称、密码和 PAT；首次必须填写 PAT");
+        return reply(req, "400 Bad Request", "检查名称与密码；首次必须填写 Wi-Fi");
     }
     // 保持旧密码必须显式选同一 SSID，开放网络则显式勾选“无密码”。
     size_t old_len = strnlen((const char *)s_saved.sta.ssid, sizeof(s_saved.sta.ssid));
@@ -217,7 +207,7 @@ static esp_err_t save_post(httpd_req_t *req) {
     s_busy = true;
     s_stage = PORTAL_CONNECTING;
     xTaskNotifyGive(s_worker);
-    return reply(req, "202 Accepted", "正在连接并验证，请保持连接设备热点");
+    return reply(req, "202 Accepted", "正在连接并保存，请保持连接设备热点");
 }
 static esp_err_t redirect_get(httpd_req_t *req) {
     if (req->content_len != 0) return reply(req, "400 Bad Request", "请求格式错误");
@@ -235,8 +225,6 @@ static void config_worker(void *arg) {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        char old_pat[QCA_PAT_MAX];
-        snprintf(old_pat, sizeof(old_pat), "%s", qca_pat());
         wifi_config_t c = s_saved;
         memset(c.sta.ssid, 0, sizeof(c.sta.ssid));
         memcpy(c.sta.ssid, s_pending.ssid, strlen(s_pending.ssid));
@@ -247,66 +235,38 @@ static void config_worker(void *arg) {
         c.sta.bssid_set = false;
         c.sta.channel = 0;   // 换网络时不带上一个 AP 的信道提示
         c.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        // 与 app_wifi_restore_creds 保持一致的连接策略：扫完全部信道后按信号强度挑
-        // 同名 AP 中最好的一个，并允许驱动原地重试一次（IDF 要求 failure_retry_cnt
-        // 必须配 WIFI_ALL_CHANNEL_SCAN）。首次关联被家用 AP 以 status=30 + Comeback
-        // Time 拒绝时，驱动内部重试是背靠背的、不遵守该定时器，真正的兜底是
-        // app_wifi.c 里 ≥1200 ms 的退避重试。
+        // 与 app_wifi_restore_creds 一致的连接策略：扫完全部信道后按信号强度挑
+        // 同名 AP 中最好的一个，并允许驱动原地重试一次。
         c.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
         c.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
         c.sta.failure_retry_cnt = 1;
         app_wifi_set_auto_reconnect(false);
         esp_wifi_disconnect();
-        // 让主动断开事件完成，避免把它当作本次连接失败；此等待只在 worker 内。
         vTaskDelay(pdMS_TO_TICKS(150));
         esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &c); // WIFI_STORAGE_RAM
         if (e == ESP_OK) e = app_wifi_connect(25000);
         if (e != ESP_OK) {
             s_stage = PORTAL_WIFI_FAILED;
         } else {
-            s_stage = PORTAL_CHECKING;
-            if (s_pending.pat[0]) qca_pat_use(s_pending.pat, false);
-            e = qca_check_auth();
-            if (e != ESP_OK) {
-                int status = qca_api_last_status();
-                s_stage = status == 401 || status == 403 ? PORTAL_PAT_FAILED : PORTAL_SERVICE_FAILED;
-            } else {
-                // 只有网络与认证均成功才落盘。NVS 不提供跨 Wi-Fi/PAT 事务；保存错误显式报告。
-                e = qca_pat_use(qca_pat(), true);
-                // 应用 NVS 镜像：IDF 的 WIFI_STORAGE_FLASH 持久化在本设备重启后会丢失
-                // STA 配置（见 app_wifi.h），用与 PAT 相同的可靠命名空间兜底，开机由
-                // app_wifi_restore_creds 回填。保存实际连接用的 c（覆盖“沿用旧密码”
-                // 情形）；密码不记录。
-                if (e == ESP_OK) e = app_wifi_save_creds((const char *)c.sta.ssid,
-                                                         (const char *)c.sta.password);
-                if (e == ESP_OK) e = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
-                if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &c);
-                s_stage = e == ESP_OK ? PORTAL_DONE : PORTAL_SAVE_FAILED;
-            }
+            // 网络成功才落盘。NVS 不提供跨 Wi-Fi 事务；保存错误显式报告。
+            s_stage = PORTAL_CONNECTING;
+            e = app_wifi_save_creds((const char *)c.sta.ssid, (const char *)c.sta.password);
+            if (e == ESP_OK) e = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+            if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &c);
+            s_stage = e == ESP_OK ? PORTAL_DONE : PORTAL_SAVE_FAILED;
         }
         memset(&c, 0, sizeof(c));
         memset(&s_pending, 0, sizeof(s_pending));
-        if (s_stage == PORTAL_DONE) {
-            memset(old_pat, 0, sizeof(old_pat));
-            ESP_LOGI(TAG, "网络与 PAT 已验证并保存，准备重启");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            esp_restart();
-        }
-        // 若持久化中途失败，尽力恢复旧配置；断电跨命名空间事务无法保证原子性。
-        if (s_stage == PORTAL_SAVE_FAILED) {
-            esp_err_t pe = qca_pat_use(old_pat, true);
-            esp_err_t we = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
-            if (we == ESP_OK) we = esp_wifi_set_config(WIFI_IF_STA, &s_saved);
-            if (pe != ESP_OK || we != ESP_OK)
-                ESP_LOGE(TAG, "配置回滚未完成，需要重试配置");
-        }
-        qca_pat_use(old_pat, false);
-        memset(old_pat, 0, sizeof(old_pat));
         app_wifi_set_auto_reconnect(false);
         esp_wifi_disconnect();
         esp_wifi_set_storage(WIFI_STORAGE_RAM);
         esp_wifi_set_config(WIFI_IF_STA, &s_saved);
         s_busy = false;
+        if (s_stage == PORTAL_DONE) {
+            ESP_LOGI(TAG, "网络已验证并保存，准备重启");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            esp_restart();
+        }
     }
 }
 
@@ -339,7 +299,6 @@ static void dns_task(void *arg) {
 
 esp_err_t app_portal_start(void) {
     s_stage = PORTAL_IDLE;
-    s_saved_pat_set = qca_pat_present();
     app_wifi_set_auto_reconnect(false);
     esp_err_t e = esp_wifi_get_config(WIFI_IF_STA, &s_saved);
     if (e != ESP_OK) goto fail;
@@ -350,7 +309,7 @@ esp_err_t app_portal_start(void) {
     uint8_t mac[6], random[28];
     e = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     if (e != ESP_OK) goto fail;
-    snprintf(s_ssid, sizeof(s_ssid), "Qoder-Passport-%02X%02X", mac[4], mac[5]);
+    snprintf(s_ssid, sizeof(s_ssid), "KidAsk-%02X%02X", mac[4], mac[5]);
     esp_fill_random(random, sizeof(random));
     // 12 位 base32 随机口令，避免模糊字形；每次进入热点更新。
     static const char alphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
