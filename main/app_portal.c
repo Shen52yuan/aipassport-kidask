@@ -18,9 +18,18 @@
 #include "lwip/sockets.h"
 #include "portal_form.h"
 
+// 配网热点口令：默认全设备统一、且每次开机固定，手机保存一次后即可自动重连，
+// 户外不必每次盯屏幕抄随机密码。需要自定义时编译时覆盖，例如
+//   -DKIDASK_AP_PASSWORD=\"my-pass-123\"   （WPA2 要求 8–63 字节）
+// 安全说明：口令公开意味着任何知道它的人都能连上配网热点；该热点只在设备
+// 未配网（或用户主动恢复出厂/重新配置）时短暂开启，保存凭据后立即重启关闭。
+#ifndef KIDASK_AP_PASSWORD
+#define KIDASK_AP_PASSWORD "kidask2026"
+#endif
+
 static const char *TAG = "app_portal";
 static volatile portal_stage_t s_stage;
-static char s_ssid[32], s_password[13], s_token[33];
+static char s_ssid[32], s_password[65], s_token[33];
 static httpd_handle_t s_http;
 static TaskHandle_t s_worker;
 static volatile bool s_busy;
@@ -326,16 +335,17 @@ esp_err_t app_portal_start(void) {
     if (e != ESP_OK) goto fail;
     esp_netif_t *ap = esp_netif_create_default_wifi_ap();
     if (!ap) { e = ESP_ERR_NO_MEM; goto fail; }
-    uint8_t mac[6], random[28];
+    uint8_t mac[6], random[16];
     e = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     if (e != ESP_OK) goto fail;
     snprintf(s_ssid, sizeof(s_ssid), "KidAsk-%02X%02X", mac[4], mac[5]);
+    // 固定口令（不再每次随机）；门户 token 仍每次随机，避免跨会话重放。
+    snprintf(s_password, sizeof(s_password), "%s", KIDASK_AP_PASSWORD);
+    // WPA2-PSK 要求 8–63 字节；自定义口令不合法时明确失败，避免越界拷贝。
+    size_t pw_len = strlen(s_password);
+    if (pw_len < 8 || pw_len > 63) { e = ESP_ERR_INVALID_ARG; goto fail; }
     esp_fill_random(random, sizeof(random));
-    // 12 位 base32 随机口令，避免模糊字形；每次进入热点更新。
-    static const char alphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-    for (int i = 0; i < 12; i++) s_password[i] = alphabet[random[i] % 32];
-    s_password[12] = 0;
-    for (int i = 0; i < 16; i++) snprintf(s_token + i * 2, 3, "%02x", random[12+i]);
+    for (int i = 0; i < 16; i++) snprintf(s_token + i * 2, 3, "%02x", random[i]);
     memset(random, 0, sizeof(random));
     // 显式设定 192.168.4.1 与 DHCP DNS/portal 地址。
     esp_netif_dhcps_stop(ap);
@@ -353,7 +363,7 @@ esp_err_t app_portal_start(void) {
     wifi_config_t ac = {0};
     memcpy(ac.ap.ssid, s_ssid, strlen(s_ssid));
     ac.ap.ssid_len = strlen(s_ssid);
-    memcpy(ac.ap.password, s_password, strlen(s_password));
+    memcpy(ac.ap.password, s_password, pw_len);
     ac.ap.channel = 1;
     ac.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ac.ap.max_connection = 2;
@@ -396,7 +406,7 @@ esp_err_t app_portal_start(void) {
         close(fd); e = ESP_FAIL; goto fail;
     }
     s_stage = PORTAL_READY;
-    ESP_LOGI(TAG, "配置热点已启动（192.168.4.1，密码不记录）");
+    ESP_LOGI(TAG, "配置热点已启动 SSID=%s（192.168.4.1，固定口令）", s_ssid);
     return ESP_OK;
 fail:
     // DNS 在最后一步才启动。其余部分失败时停止 HTTP 与尚未接单的 worker。
