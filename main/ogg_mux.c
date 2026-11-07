@@ -3,7 +3,9 @@
 
 #include <string.h>
 
-// ---- Ogg 标准 CRC-32（多项式 0x04C11DB7，与以太网 CRC 同）----
+// ---- Ogg 标准 CRC-32（多项式 0x04C11DB7, 初值 0, 无反射/无最终异或）----
+// 注意：与以太网 CRC32 不同，以太网是 init=0xFFFFFFFF + 最终异或；用错会让
+// 服务端 ffmpeg 每页都报 "CRC mismatch!" 并拒收整段音频（v0.1.5 实测 422）。
 static uint32_t s_crc_table[256];
 static bool s_crc_ready;
 
@@ -19,7 +21,7 @@ static void crc_init(void) {
 
 static uint32_t crc32_ogg(const uint8_t *buf, int len) {
     if (!s_crc_ready) crc_init();
-    uint32_t c = 0xFFFFFFFFU;
+    uint32_t c = 0;
     for (int i = 0; i < len; i++)
         c = (c << 8) ^ s_crc_table[((c >> 24) ^ buf[i]) & 0xFF];
     return c;
@@ -71,7 +73,8 @@ static int lace_segments(const uint8_t *data, int len,
         seg_data[0] = data; seg_len[0] = 0;
         return 1;
     }
-    int n = (len + 254) / 255;
+    // 末片必须 < 255 才代表本包结束；len 恰为 255 倍数时补一个 0 长度片。
+    int n = len / 255 + 1;
     if (n > max_seg) return -1;
     for (int i = 0; i < n; i++) {
         int chunk = (i == n - 1) ? (len - i * 255) : 255;
@@ -109,14 +112,21 @@ int ogg_mux_header_page(ogg_mux_t *m, uint8_t *out, size_t out_cap) {
     for (int i = 0; i < 4; i++) tags[tl++] = (uint8_t)(tlen >> (8 * i));
     memcpy(tags + tl, tag, tlen); tl += tlen;
 
-    const uint8_t *seg_data[2];
-    int seg_len[2];
-    seg_data[0] = head;  seg_len[0] = (int)sizeof(head);
-    seg_data[1] = tags;  seg_len[1] = tl;
+    // RFC 7845：BOS 页只能包含 OpusHead 这一个包，OpusTags 必须单独一页。
+    // 两者同页时服务端 ffmpeg 直接拒收（v0.1.5 实测 422）。
+    const uint8_t *sd0[1] = { head };
+    int sl0[1] = { (int)sizeof(head) };
+    int n0 = build_page(m, 0x02 /*BOS*/, 0, sd0, sl0, 1, out, out_cap);
+    if (n0 <= 0) return -1;
+    m->pageno++;
 
-    int n = build_page(m, 0x02 /*BOS*/, 0, seg_data, seg_len, 2, out, out_cap);
-    if (n > 0) { m->pageno++; m->bos_done = true; }
-    return n;
+    const uint8_t *sd1[1] = { tags };
+    int sl1[1] = { tl };
+    int n1 = build_page(m, 0x00, 0, sd1, sl1, 1, out + n0, out_cap - (size_t)n0);
+    if (n1 <= 0) return -1;
+    m->pageno++;
+    m->bos_done = true;
+    return n0 + n1;   // 返回两页总长度，调用方一次追加即可
 }
 
 #define MAX_SEG 64
