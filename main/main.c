@@ -449,6 +449,9 @@ void app_main(void) {
         // BSP 内部音量默认 0（静音），必须显式设置；后续每次 codec open 都会沿用。
         bsp_audio_set_volume(KID_VOLUME);
         ESP_LOGI(TAG, "输出音量已设为 %d%%", KID_VOLUME);
+        // v0.1.8: 开机播 1 秒 1kHz 自检音，不依赖网络/按键，用来确认
+        // ES8311 输出级是否真的在出声；同时回读 DAC 音量寄存器。
+        kid_audio_selftest();
     }
     if (bsp_battery_init() != ESP_OK) ESP_LOGW(TAG, "电量计不可用");
     s_input_ready = true;
