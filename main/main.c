@@ -37,7 +37,9 @@
 static const char *TAG = "main";
 
 #define INPUT_QUEUE_DEPTH 8
-#define WIFI_TIMEOUT_MS   20000
+// 户外手机热点：免验证保存后设备重启，用户还需手动打开热点，留出宽松窗口。
+// app_wifi_connect 内部有退避重连，热点一出现即拿到 IP 并立即返回。
+#define WIFI_TIMEOUT_MS   35000
 #define LIST_PAGE_STEP    5
 
 typedef struct {
