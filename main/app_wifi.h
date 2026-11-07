@@ -1,6 +1,6 @@
 // main/app_wifi.h —— Wi-Fi STA 连接与“下次开机进入配网”标记。
 //
-// Wi-Fi 凭据由 esp_wifi 存在 NVS（WIFI_STORAGE_FLASH），并在应用命名空间 qca_app
+// Wi-Fi 凭据由 esp_wifi 存在 NVS（WIFI_STORAGE_FLASH），并在应用命名空间 kidask
 // 保留一份镜像作为兜底（IDF 持久化在本设备实测会丢失）；镜像里还记着上次连通时 AP
 // 的主信道，下次连接作为扫描起点提示以加快联网。本模块绝不打印 SSID/密码内容，
 // 日志只出现长度、信道与返回码。
@@ -26,8 +26,8 @@ esp_err_t app_wifi_connect(int timeout_ms);
 
 bool app_wifi_is_connected(void);
 
-// 应用 NVS（qca_app）里的 Wi-Fi 凭据镜像：IDF 驱动的 WIFI_STORAGE_FLASH 持久化在
-// 本设备实测中重启后会丢失 STA 配置，用与 PAT 相同的可靠命名空间兜底。密码明文存
+// 应用 NVS（kidask）里的 Wi-Fi 凭据镜像：IDF 驱动的 WIFI_STORAGE_FLASH 持久化在
+// 本设备实测中重启后会丢失 STA 配置，用可靠命名空间兜底。密码明文存
 // 于 NVS（与既有 PAT 强度一致），任何日志只记录长度，绝不打印 SSID/密码内容。
 // 配网成功后保存当前生效凭据（含“沿用旧密码”情形，故由调用方传入实际连接用配置），
 // 同一次提交里带上已学到的信道提示。
