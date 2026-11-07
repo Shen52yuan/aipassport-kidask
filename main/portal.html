@@ -2,17 +2,17 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Qoder Passport · 设备配置</title>
+<title>KidAsk · 设备配置</title>
 <style>
 :root{color-scheme:dark;font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;background:#0b1020;color:#e2e8f0}
 *{box-sizing:border-box}body{margin:0;padding:30px 18px 48px}main{max-width:520px;margin:auto}.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px}.mark{width:12px;height:12px;background:#2dd4bf;border-radius:3px}h1{font-size:28px;line-height:1.3;margin:25px 0 10px}p{margin:8px 0;color:#94a3b8}.card{padding:22px;background:#161d33;border:1px solid #263047;border-radius:16px;margin-top:20px}h2{font-size:17px;margin:0 0 14px;color:#2dd4bf}label{display:block;margin:16px 0 6px;font-weight:600}input,select,button{font:inherit;width:100%;padding:12px;border-radius:10px;border:1px solid #354159;background:#0b1020;color:#e2e8f0}input:focus,select:focus,button:focus-visible{outline:2px solid #2dd4bf;outline-offset:2px}input[type=checkbox]{width:auto;margin-right:8px;accent-color:#2dd4bf}.check{font-size:13px;font-weight:400;margin:8px 0}.row{display:flex;gap:8px;align-items:center}.row input{min-width:0}.row button{width:auto;white-space:nowrap;font-size:13px}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}.primary{background:#2dd4bf;color:#082624;font-weight:700;border:0;margin-top:20px}.small{font-size:12px;color:#94a3b8}.note{border-left:3px solid #f59e0b;padding-left:12px;margin:16px 0;color:#cbd5e1;font-size:13px}a{color:#38bdf8;text-underline-offset:3px}.status{border:1px solid #354159;border-radius:12px;padding:13px 16px;margin-top:20px;color:#cbd5e1}.status[data-tone=error]{border-color:#f87171;color:#fca5a5}.status[data-tone=ok]{border-color:#2dd4bf;color:#5eead4}footer{font-size:12px;color:#64748b;text-align:center;margin-top:24px}[hidden]{display:none!important}
 </style>
 </head>
 <body><main>
-<div class="brand"><span class="mark"></span>Qoder Passport</div>
-<h1>让助手连接你的世界</h1>
-<p>在这里配置 Wi-Fi 与 Qoder Cloud Agents 的个人访问令牌。设置只保存在设备上。</p>
-<div class="note">这个热点用于配置，不提供互联网。请先获取 PAT，再连接设备热点；如果链接打不开，切换手机移动数据或使用另一台设备查看。</div>
+<div class="brand"><span class="mark"></span>KidAsk 问答机</div>
+<h1>让小问号连上网络</h1>
+<p>在这里配置 Wi-Fi。设置只保存在设备上，不需要任何账号或令牌。</p>
+<div class="note">这个热点用于配置，不提供互联网。请连接设备热点后打开本页；如果链接打不开，切换手机移动数据或使用另一台设备查看。</div>
 <form id="config" autocomplete="off">
 <section class="card"><h2>01 · 连接 Wi-Fi</h2>
 <div class="row"><button type="button" id="scan">刷新 Wi-Fi 列表</button></div>
@@ -29,17 +29,11 @@
 <label class="check"><input type="checkbox" id="open">这是无密码网络（开放 Wi-Fi）；普通模式由扫描结果确定</label>
 <p class="small">不支持需网页登录的酒店/校园网络或企业 802.1X 认证。请使用可直接联网的家庭路由器或手机热点。</p>
 </section>
-<section class="card"><h2>02 · 授权 Qoder Cloud Agents</h2>
-<p><a href="https://docs.qoder.com/zh/cloud-agents/api/conventions/authentication" target="_blank" rel="noopener noreferrer">如何获取 PAT →</a></p>
-<p class="small">登录 qoder.com → 设置 → 个人访问令牌 → 创建令牌。选择所需权限与有效期；令牌完整内容只显示一次。</p>
-<label for="pat">PAT Key</label><div class="row"><input type="password" id="pat" name="pat" maxlength="255" placeholder="pt-…" autocapitalize="none" spellcheck="false" autocomplete="new-password"><button type="button" data-toggle="pat" aria-label="显示 PAT">显示</button></div>
-<p class="small" id="patHint">首次配置必须填写 PAT。设备会验证其访问权限，不会把令牌回显到网页。</p>
-</section>
-<button type="submit" class="primary" id="save">验证并保存配置</button>
+<button type="submit" class="primary" id="save">保存并连接</button>
 </form>
 <div id="status" class="status" role="status" aria-live="polite">正在连接设备配置服务…</div>
 <footer>请保持连接设备热点，直到提示配置成功。<br>热点连接使用 WPA2；设备 NVS 目前未启用存储加密。
-<p>恢复出厂设置：在设备的模板选择页或热点配置页长按 OK → 设备设置 → 恢复出厂设置。会删除 Wi-Fi、PAT 和音量设置，不删除云端会话；需要设备上二次确认。</p></footer>
+<p>恢复出厂设置：在设备的待机页长按 OK → 设备设置 → 恢复出厂设置。会删除 Wi-Fi 设置，不删除云端内容；需要设备上二次确认。</p></footer>
 </main>
 <script>
 'use strict';
@@ -103,9 +97,9 @@ async function scanNetworks(){
     }finally{scanning=false;controls();}
 }
 async function poll(){try{const s=await json('/status');token=s.token;done=s.done;
-if(!init){savedSsid=s.ssid||'';$('pat').required=!s.pat_set;if(s.pat_set){$('patHint').textContent='PAT 已配置。留空保持原令牌，填写新值则替换。';$('pat').placeholder='已配置 · 留空保持不变';}init=true;}
-lock(s.busy||done);if(s.busy||done||s.stage!==lastStage)message(s.message,done?'ok':s.stage>=4&&s.stage<=7?'error':'');lastStage=s.stage;
-if(done){$('pass').value='';$('pat').value='';message('配置成功！设备即将重启，请切回正常网络。','ok');return;}
+if(!init){savedSsid=s.ssid||'';init=true;}
+lock(s.busy||done);if(s.busy||done||s.stage!==lastStage)message(s.message,done?'ok':s.stage>=3&&s.stage<=5?'error':'');lastStage=s.stage;
+if(done){$('pass').value='';message('配置成功！设备即将重启，请切回正常网络。','ok');return;}
 if(!autoScanned&&!busy&&token){autoScanned=true;void scanNetworks();}
 }catch(e){lastStage=null;if(!busy&&!scanning&&!saving&&!done)message('暂未连接设备。请确认仍连接热点，并打开 http://192.168.4.1/。','error');}
 pollTimer=setTimeout(poll,1500);}
@@ -125,12 +119,11 @@ $('config').addEventListener('submit',async e=>{
         if(!$('networks').value){message('请选择检测到的 Wi-Fi，或勾选“连接隐藏网络（手动输入名称）”。','error');return;}
         syncNetwork();
     }else if(!$('ssid').value){message('请输入隐藏网络的 Wi-Fi 名称。','error');return;}
-    // maxlength limits characters, not UTF-8 bytes; the device remains authoritative.
-    const body=new URLSearchParams({ssid:$('ssid').value,pass:$('open').checked?'':$('pass').value,pat:$('pat').value.trim(),open:$('open').checked?'1':'0'});
+    const body=new URLSearchParams({ssid:$('ssid').value,pass:$('open').checked?'':$('pass').value,open:$('open').checked?'1':'0'});
     saving=true; controls();
     try{
         const s=await json('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Portal-Token':token},body:body.toString()});
-        $('pass').value=''; $('pat').value=''; lock(true); if(!done)message(s.message);
+        $('pass').value=''; lock(true); if(!done)message(s.message);
     }catch(err){if(!done)message(err.message,'error');}
     finally{saving=false;controls();}
 });
