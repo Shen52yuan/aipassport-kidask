@@ -37,6 +37,7 @@ typedef struct {
     uint8_t    *buf;
     size_t      len;
     size_t      cap;
+    size_t      expected_len;   // Content-Length：一次分配到位，避免 realloc 翻倍峰值
 } net_ctx_t;
 
 static esp_err_t on_event(esp_http_client_event_t *ev) {
@@ -49,13 +50,17 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
         } else if (strcasecmp(ev->header_key, "X-Asr-Text") == 0) {
             c->resp->asr_len = url_decode(ev->header_value, ev->data_len,
                                           c->resp->asr, KID_ASR_CAP);
+        } else if (strcasecmp(ev->header_key, "Content-Length") == 0) {
+            long n = strtol(ev->header_value, NULL, 10);
+            if (n > 0 && n <= 256 * 1024) c->expected_len = (size_t)n;
         }
         break;
     case HTTP_EVENT_ON_DATA:
         if (ev->data_len > 0) {
             size_t need = c->len + (size_t)ev->data_len;
             if (need > c->cap) {
-                size_t ncap = c->cap ? c->cap * 2 : 8192;
+                size_t ncap = c->cap ? c->cap * 2
+                                     : (c->expected_len ? c->expected_len : 8192);
                 while (ncap < need) ncap *= 2;
                 uint8_t *nb = (uint8_t *)realloc(c->buf, ncap);
                 if (!nb) { ESP_LOGE(TAG, "音频缓冲分配失败"); return ESP_ERR_NO_MEM; }
