@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "kid_opus.h"
 #include "ogg_mux.h"
+#include "ogg_demux.h"
 
 static const char *TAG = "kid_audio";
 
