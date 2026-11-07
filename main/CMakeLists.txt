@@ -1,5 +1,9 @@
-# 「Qoder Passport」应用。BSP 参考 demo（demo_*.c / ui_pixel*.c / demo_navigation.c）
-# 保留在仓库中供查阅与 host 测试，但不再编入固件。
+# 「Aipassport-KidAsk」应用组件。
+# 基于 Qoder-Passport fork：去除 QCA/PAT 云端实时语音通道，改为
+# 「按住 OK 说话 → Ogg Opus 上行 → 自建服务器 ASR+DeepSeek(儿童 prompt)+TTS
+#  → Ogg Opus 下行童声播放 + 屏幕要点」。
+# 已删除：qca_pat.c / qca_api.c / qca_list_parse.c / qca_voice.c / b64_stream.c / qjson.c / voice_logic.c
+# 新增：   ogg_mux.c / ogg_demux.c / kid_net.c / kid_opus.c / kid_audio.c（录音→Opus→Ogg / Ogg→Opus→播放）
 idf_component_register(
     SRCS "main.c"
          "app_ui.c"
@@ -7,16 +11,14 @@ idf_component_register(
          "app_wifi.c"
          "app_portal.c"
          "portal_form.c"
-         "qca_pat.c"
-         "qca_api.c"
-         "qca_list_parse.c"
-         "qca_voice.c"
          "tls_mfl.c"
-         "qjson.c"
-         "b64_stream.c"
          "audio_dsp.c"
-         "voice_logic.c"
          "utf8_util.c"
+         "ogg_mux.c"
+         "ogg_demux.c"
+         "kid_net.c"
+         "kid_opus.c"
+         "kid_audio.c"
          "../assets/fonts/app_font_cjk_16.c"
          "../assets/fonts/app_font_status_28.c"
     INCLUDE_DIRS "."
@@ -26,7 +28,7 @@ idf_component_register(
 )
 
 # 见 tls_mfl.c：包装 esp-tls 调用的 mbedtls_ssl_config_defaults，为 TLS 客户端请求 4KB
-# 最大分片，避免语音会话中为满长记录申请约 16.7KB 连续接收缓冲。-u 确保包装函数被链接进来。
+# 最大分片，避免语音/音频收发包中为满长记录申请约 16.7KB 连续接收缓冲。-u 确保包装函数被链接进来。
 target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=mbedtls_ssl_config_defaults"
     "-Wl,-u,__wrap_mbedtls_ssl_config_defaults")
