@@ -28,6 +28,7 @@ static wifi_config_t s_saved;    // 仅配置模式保存一份旧凭据，用�
 static struct {
     char ssid[33], pass[65];
     bool open;
+    bool blind;   // 手机热点模式：配置时目标热点未开，跳过在线验证直接保存
 } s_pending;
 
 extern const char portal_html_start[] asm("_binary_portal_html_start");
@@ -184,13 +185,16 @@ static esp_err_t save_post(httpd_req_t *req) {
         if (n <= 0) { memset(body, 0, req->content_len + 1); free(body); return ESP_FAIL; }
         got += n;
     }
-    char open[2] = {0};
+    char open[2] = {0}, blind[2] = {0};
     bool valid = form_get(body, got, "ssid", s_pending.ssid, sizeof(s_pending.ssid)) >= 0 &&
         form_get(body, got, "pass", s_pending.pass, sizeof(s_pending.pass)) >= 0 &&
         form_get(body, got, "open", open, sizeof(open)) >= 0;
+    // blind 为可选字段：旧页面/家庭路由器不带它，按在线验证处理。
+    form_get(body, got, "blind", blind, sizeof(blind));
     memset(body, 0, req->content_len + 1);
     free(body);
     s_pending.open = strcmp(open, "1") == 0;
+    s_pending.blind = strcmp(blind, "1") == 0;
     if (!valid || !form_ssid_valid(s_pending.ssid) ||
         !form_wifi_pass_valid(s_pending.pass)) {
         memset(&s_pending, 0, sizeof(s_pending));
@@ -243,17 +247,33 @@ static void config_worker(void *arg) {
         app_wifi_set_auto_reconnect(false);
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(150));
+        const bool blind = s_pending.blind;
         esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &c); // WIFI_STORAGE_RAM
-        if (e == ESP_OK) e = app_wifi_connect(25000);
-        if (e != ESP_OK) {
-            s_stage = PORTAL_WIFI_FAILED;
-        } else {
-            // 网络成功才落盘。NVS 不提供跨 Wi-Fi 事务；保存错误显式报告。
-            s_stage = PORTAL_CONNECTING;
-            e = app_wifi_save_creds((const char *)c.sta.ssid, (const char *)c.sta.password);
+        if (blind) {
+            // 手机热点模式：同一台手机无法同时开热点(AP)并连接设备热点(STA)，
+            // 配网时目标热点物理上不在空中，无法当场验证。跳过在线连接，直接
+            // 持久化凭据并重启，由开机流程在用户打开热点后自动连上。
+            // SSID/密码校验、AP 来源校验与 X-Portal-Token 校验均照常生效。
+            ESP_LOGI(TAG, "手机热点模式：跳过在线验证，直接保存凭据");
+            if (e == ESP_OK) e = app_wifi_save_creds((const char *)c.sta.ssid,
+                                                     (const char *)c.sta.password);
             if (e == ESP_OK) e = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
             if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &c);
             s_stage = e == ESP_OK ? PORTAL_DONE : PORTAL_SAVE_FAILED;
+        } else if (e == ESP_OK) {
+            e = app_wifi_connect(25000);
+            if (e != ESP_OK) {
+                s_stage = PORTAL_WIFI_FAILED;
+            } else {
+                // 网络成功才落盘。NVS 不提供跨 Wi-Fi 事务；保存错误显式报告。
+                s_stage = PORTAL_CONNECTING;
+                e = app_wifi_save_creds((const char *)c.sta.ssid, (const char *)c.sta.password);
+                if (e == ESP_OK) e = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+                if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &c);
+                s_stage = e == ESP_OK ? PORTAL_DONE : PORTAL_SAVE_FAILED;
+            }
+        } else {
+            s_stage = PORTAL_WIFI_FAILED;
         }
         memset(&c, 0, sizeof(c));
         memset(&s_pending, 0, sizeof(s_pending));
