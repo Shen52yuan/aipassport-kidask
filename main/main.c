@@ -334,10 +334,17 @@ static void run_ask(void) {
     }
 
     if (resp.status == 200 && resp.audio && resp.audio_len) {
-        app_ui_set_state(KID_UI_ANSWER, resp.answer_len ? resp.answer : NULL);
+        // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
+        const char *card = resp.answer_len ? resp.answer
+                         : (resp.asr_len ? resp.asr : "正在读给你听~");
+        ESP_LOGI(TAG, "屏幕要点 %u 字节 / ASR %u 字节",
+                 (unsigned)resp.answer_len, (unsigned)resp.asr_len);
+        app_ui_set_state(KID_UI_ANSWER, card);
         kid_audio_play_ogg(resp.audio, resp.audio_len);
         LOG_MEM("play_done");
         kid_resp_free(&resp);
+        // 回待机页会清掉要点卡片，留 3 秒让孩子/家长看清屏幕文字。
+        vTaskDelay(pdMS_TO_TICKS(3000));
         return;
     }
 
@@ -436,7 +443,13 @@ void app_main(void) {
         }
     }
     s_audio_ok = (bsp_audio_init() == ESP_OK);
-    if (!s_audio_ok) ESP_LOGE(TAG, "音频初始化失败");
+    if (!s_audio_ok) {
+        ESP_LOGE(TAG, "音频初始化失败");
+    } else {
+        // BSP 内部音量默认 0（静音），必须显式设置；后续每次 codec open 都会沿用。
+        bsp_audio_set_volume(KID_VOLUME);
+        ESP_LOGI(TAG, "输出音量已设为 %d%%", KID_VOLUME);
+    }
     if (bsp_battery_init() != ESP_OK) ESP_LOGW(TAG, "电量计不可用");
     s_input_ready = true;
 
