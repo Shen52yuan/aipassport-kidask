@@ -1,4 +1,9 @@
-## IDF Component Manager manifest for the QCA companion app.
+## IDF Component Manager manifest for Aipassport-KidAsk.
+## 去除 QCA WebSocket 通道依赖；仅保留 Opus 编解码。
 dependencies:
-  # WebSocket client for the QCA realtime voice channel.
-  espressif/esp_websocket_client: "^1.5.0"
+  # Opus 核心库（libopus 移植，78/esp-opus）：同时提供 opus_encoder_* 与 opus_decoder_* API。
+  # 任务卡原列 esp-opus-encoder + esp-opus-decoder；实际发布组件为：
+  #   - 78/esp-opus       （核心，含完整编解码，本固件直接用其 API）
+  #   - 78/esp-opus-encoder（可选封装层，本固件未使用）
+  # 不存在独立的 "esp-opus-decoder" 组件 —— 解码器本就是核心库的一部分。
+  78/esp-opus: "^1.0.5"
