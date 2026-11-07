@@ -24,6 +24,11 @@ static const char *TAG = "kid_audio";
 #define FRAME_SAMPLES  320
 #define FRAME_BYTES   (FRAME_SAMPLES * 2)
 
+// v0.1.9 录音留白：儿童说话尾音常被松手瞬间切掉，按键机械声又会混进首帧。
+// 起录丢弃前 150ms、松手后补采 250ms，实测能明显减少「尾字丢失→ASR 幻觉」。
+#define KID_REC_LEADIN_MS  150
+#define KID_REC_TAIL_MS    250
+
 // 容纳一页封装结果（最大包 ≤1275 字节 + Ogg 页头 ≤64 字节，留足余量）。
 #define PAGE_CAP       1536
 
@@ -111,16 +116,25 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
     }
 
     const int64_t t0 = esp_timer_get_time();
+    int64_t stop_at = 0;
 
     for (;;) {
-        if (should_stop && should_stop()) break;
+        // v0.1.9：松手后不立即收尾，再录 KID_REC_TAIL_MS。儿童常拖长尾音，
+        // 之前松手瞬间切掉最后一个字，whisper 便识别成别的词甚至产生幻觉。
+        if (should_stop && should_stop() && stop_at == 0) {
+            stop_at = esp_timer_get_time();
+        }
         const int64_t now = esp_timer_get_time();
+        if (stop_at && now - stop_at >= (int64_t)KID_REC_TAIL_MS * 1000) break;
         if (now - t0 >= (int64_t)KID_REC_MAX_MS * 1000) break;
 
         if (bsp_audio_read(w->pcm, FRAME_BYTES) != ESP_OK) {
             // 瞬态读失败：跳过本帧，不计入时长。
             continue;
         }
+        // 前导 KID_REC_LEADIN_MS 只消费不编码：按键机械声与 codec 刚 open 时的
+        // 直流瞬态都落在这段，编进去会拉低服务端的有效语音判定。
+        if (now - t0 < (int64_t)KID_REC_LEADIN_MS * 1000) continue;
         if (on_level) on_level(frame_level(w->pcm, FRAME_SAMPLES));
 
         int on = kid_encoder_encode(enc, w->pcm, FRAME_SAMPLES, w->opus, sizeof(w->opus));
@@ -356,4 +370,29 @@ void kid_audio_selftest(void) {
     }
     ESP_LOGI(TAG, "=== 音频自检结束: 写入 %u 字节, 错误 %u ===", (unsigned)bytes, (unsigned)errs);
     kid_audio_dump_regs("selftest_after");
+}
+
+// v0.1.9：错误页/网络异常的短促「嘀」提示音。复用自检音正弦表与静态缓冲，
+// 全程不占 app 任务栈（32KB 栈要留给 libopus 的 alloca，见 MEMORY 红线）。
+// 注意：这不是语音；「没听清请补充」的童声引导由服务端 X-Need-Retry 提供。
+void kid_audio_beep(int count) {
+    if (count <= 0) count = 1;
+    if (count > 4) count = 4;
+    static int16_t buf[800];              // 50ms @16k/mono，静态区避免占栈
+    esp_err_t e = bsp_audio_set_format(16000, 16, 1);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "提示音 set_format 失败: %s", esp_err_to_name(e));
+        return;
+    }
+    bsp_audio_set_volume(KID_VOLUME);
+    for (int n = 0; n < count; n++) {
+        for (int block = 0; block < 2; block++) {   // 2 × 50ms = 100ms 一声
+            for (int i = 0; i < 800; i++) buf[i] = k_sine1k[(block * 800 + i) & 15];
+            bsp_audio_set_volume(KID_VOLUME);       // 兜住 codec lazy 重配
+            if (bsp_audio_write(buf, sizeof(buf)) != ESP_OK) return;
+        }
+        memset(buf, 0, sizeof(buf));                 // 声间 50ms 静音
+        bsp_audio_write(buf, sizeof(buf));
+    }
+    ESP_LOGI(TAG, "提示音播放完成 (%d 声)", count);
 }
