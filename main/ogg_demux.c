@@ -4,6 +4,7 @@
 // 但正确支持 Ogg lacing —— 一个包可由多片（255 字节）组成，并可在页边界处跨页续接。
 #include "ogg_demux.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 // 单个 Opus 数据包重组缓冲上限。上行封装单页 ≤ 4KB，故单个包不会超过此值。
@@ -14,7 +15,12 @@ ogg_demux_ret_t ogg_demux_parse(const uint8_t *buf, int len, void *user,
                                 void (*on_packet)(void *user, const uint8_t *data, int plen)) {
     if (len < 0) return OGG_DEMUX_ERR;
 
-    uint8_t reasm[REASM_CAP];
+    // 8KB 重组缓冲放堆上：它原本是栈数组，单这一项就等于整个 app 任务栈额度，
+    // 播放回答时必然触发 Stack protection fault（v0.1.2 实测）。
+    uint8_t *reasm = (uint8_t *)malloc(REASM_CAP);
+    if (!reasm) return OGG_DEMUX_ERR;
+    ogg_demux_ret_t ret = OGG_DEMUX_OK;
+
     int reasm_len = 0;
     int pkt_index = 0;   // 0 = OpusHead, 1 = OpusTags, ≥2 = 数据包含
     int pos = 0;
@@ -40,7 +46,7 @@ ogg_demux_ret_t ogg_demux_parse(const uint8_t *buf, int len, void *user,
         int seg_off = data_off;
         for (int i = 0; i < nseg; i++) {
             int sl = buf[pos + segtab + i];
-            if (reasm_len + sl > REASM_CAP) return OGG_DEMUX_ERR;
+            if (reasm_len + sl > REASM_CAP) { ret = OGG_DEMUX_ERR; goto done; }
             if (sl) memcpy(reasm + reasm_len, buf + seg_off, sl);
             reasm_len += sl;
             seg_off += sl;
@@ -69,5 +75,8 @@ ogg_demux_ret_t ogg_demux_parse(const uint8_t *buf, int len, void *user,
     }
 
     (void)reasm_len;  // 末尾若仍有未结束的跨页包，说明流截断，忽略。
-    return OGG_DEMUX_OK;
+
+done:
+    free(reasm);
+    return ret;
 }
