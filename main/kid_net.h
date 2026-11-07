@@ -7,8 +7,8 @@
 #define KID_ENDPOINT "https://tonynotatom.xyz/kid/ask-bb99ef8c69b6d89f8c6f474ebe97fc55/"
 #define KID_HTTP_TIMEOUT_MS 30000
 
-#define KID_ANSWER_CAP 160   /* X-Answer-Text URL 解码后字节上限（任务卡 ≤120 字） */
-#define KID_ASR_CAP    320   /* X-Asr-Text 上限 */
+#define KID_ANSWER_CAP 512   /* X-Answer-Text URL 解码后字节上限（任务卡 ≤120 字 ≈360B） */
+#define KID_ASR_CAP    512   /* X-Asr-Text 上限 */
 
 typedef struct {
     int      status;        /* HTTP 状态码；0 表示连接级失败（DNS/TLS/超时） */
