@@ -12,22 +12,24 @@
 <div class="brand"><span class="mark"></span>KidAsk 问答机</div>
 <h1>让小问号连上网络</h1>
 <p>在这里配置 Wi-Fi。设置只保存在设备上，不需要任何账号或令牌。</p>
-<div class="note">这个热点用于配置，不提供互联网。请连接设备热点后打开本页；如果链接打不开，切换手机移动数据或使用另一台设备查看。</div>
+<div class="note">这个热点仅用于配置，不提供互联网。链接打不开时请关闭手机移动数据，或换一台设备打开本页。</div>
+<div class="note"><b>户外要连自己的手机热点？</b>同一台手机通常不能一边开热点、一边连设备热点——连上本页时手机热点会被系统自动关掉，所以列表里看不到它。请点「我要连手机热点」，手填热点名称与密码，设备会<b>先保存、不要求当场连上</b>；保存后立刻打开手机热点，设备重启即自动连接。<br><b>iPhone 必做：</b>「设置 → 个人热点」打开<b>「最大兼容性」</b>，把热点降到 2.4 GHz（本设备不支持 5 GHz）。<br>若有第二台设备（如电脑）：让手机保持开热点、用电脑连设备热点打开本页，即可直接从列表选择并当场验证。</div>
 <form id="config" autocomplete="off">
 <section class="card"><h2>01 · 连接 Wi-Fi</h2>
-<div class="row"><button type="button" id="scan">刷新 Wi-Fi 列表</button></div>
+<div class="row"><button type="button" id="scan">刷新 Wi-Fi 列表</button><button type="button" id="hotspotShortcut">我要连手机热点</button></div>
 <label for="networks">附近的 2.4 GHz 网络</label>
 <select id="networks" required aria-describedby="scanStatus"><option value="">请选择检测到的 Wi-Fi</option></select>
 <p id="scanStatus" class="small" role="status" aria-live="polite">设备就绪后将自动扫描附近网络。</p>
-<label class="check"><input type="checkbox" id="hiddenNetwork" aria-controls="manualNetwork">连接隐藏网络（手动输入名称）</label>
+<label class="check"><input type="checkbox" id="hiddenNetwork" aria-controls="manualNetwork">列表里没有？手动输入 Wi-Fi 名称（手机热点 / 隐藏网络）</label>
 <div id="manualNetwork" hidden>
-<label for="ssid">隐藏网络的 Wi-Fi 名称</label><input id="ssid" name="ssid" readonly hidden maxlength="32" placeholder="输入隐藏网络的完整名称" autocapitalize="none" spellcheck="false">
-<p class="small">名称最多 32 字节；页面 maxlength 限制不是字节校验，最终以设备校验为准。</p>
+<label for="ssid">Wi-Fi 名称（手机热点名 / 隐藏网络名）</label><input id="ssid" name="ssid" readonly hidden maxlength="32" placeholder="例如：我的 iPhone" autocapitalize="none" spellcheck="false">
+<p class="small">名称最多 32 字节；页面 maxlength 限制不是字节校验，最终以设备校验为准。iPhone 热点名称就是手机名称。</p>
+<label class="check"><input type="checkbox" id="hotspotMode">这是手机热点：现在先保存、不要求当场连上（保存后我会打开热点）</label>
 </div>
-<label for="pass">Wi-Fi 密码</label><div class="row"><input type="password" id="pass" name="pass" maxlength="64" placeholder="输入路由器密码" autocomplete="new-password"><button type="button" data-toggle="pass" aria-label="显示 Wi-Fi 密码">显示</button></div>
+<label for="pass">Wi-Fi 密码</label><div class="row"><input type="password" id="pass" name="pass" maxlength="64" placeholder="输入 Wi-Fi 密码" autocomplete="new-password"><button type="button" data-toggle="pass" aria-label="显示 Wi-Fi 密码">显示</button></div>
 <p id="saved" class="small">同一网络密码留空可保持原密码；新网络需填密码。</p>
 <label class="check"><input type="checkbox" id="open">这是无密码网络（开放 Wi-Fi）；普通模式由扫描结果确定</label>
-<p class="small">不支持需网页登录的酒店/校园网络或企业 802.1X 认证。请使用可直接联网的家庭路由器或手机热点。</p>
+<p class="small">仅支持 2.4 GHz、可直接联网的家庭路由器或手机热点；不支持 5 GHz、需网页登录的酒店/校园网络或企业 802.1X 认证。</p>
 </section>
 <button type="submit" class="primary" id="save">保存并连接</button>
 </form>
@@ -48,6 +50,7 @@ function controls(){
     $('ssid').hidden=!manual; $('ssid').readOnly=!manual; $('ssid').required=manual;
     $('networks').required=!manual; $('networks').disabled=locked||manual;
     $('open').disabled=locked||!manual;
+    $('hotspotMode').disabled=locked||!manual;
     $('pass').disabled=locked||$('open').checked||(!manual&&!$('networks').value);
 }
 function lock(value){busy=value;controls();}
@@ -89,11 +92,11 @@ async function scanNetworks(){
         savedSelectionPending=false;
         if(!$('hiddenNetwork').checked)syncNetwork();
         $('scanStatus').textContent=unique.size
-            ?(previous&&!retained?'原选网络已不在列表中，请重新选择。':'扫描完成，请选择检测到的 Wi-Fi。')+'可点击“刷新 Wi-Fi 列表”；隐藏网络请勾选“连接隐藏网络（手动输入名称）”。'
-            :'未检测到可用的 2.4 GHz Wi-Fi。请点击“刷新 Wi-Fi 列表”重试；隐藏网络请勾选“连接隐藏网络（手动输入名称）”。';
+            ?(previous&&!retained?'原选网络已不在列表中，请重新选择。':'扫描完成，请选择检测到的 Wi-Fi。')+'列表里没有（含手机热点）请点“我要连手机热点”。'
+            :'未检测到 2.4 GHz Wi-Fi。手机热点此时通常已被系统关闭，请点“我要连手机热点”手动填写；或点“刷新 Wi-Fi 列表”重试。';
     }catch(e){
         clearNetworks();
-        $('scanStatus').textContent='扫描失败：'+e.message+'。请点击“刷新 Wi-Fi 列表”重试；隐藏网络请勾选“连接隐藏网络（手动输入名称）”。';
+        $('scanStatus').textContent='扫描失败：'+e.message+'。请点“我要连手机热点”手动填写，或点“刷新 Wi-Fi 列表”重试。';
     }finally{scanning=false;controls();}
 }
 async function poll(){try{const s=await json('/status');token=s.token;done=s.done;
@@ -107,7 +110,15 @@ $('scan').addEventListener('click',scanNetworks);
 $('networks').addEventListener('change',()=>{savedSelectionPending=false;syncNetwork();});
 $('hiddenNetwork').addEventListener('change',()=>{
     savedSelectionPending=false; $('networks').value=''; selectedKey='';
-    $('ssid').value=''; $('pass').value=''; $('open').checked=false; controls();
+    $('ssid').value=''; $('pass').value=''; $('open').checked=false;
+    $('hotspotMode').checked=false; controls();
+});
+$('hotspotShortcut').addEventListener('click',()=>{
+    if(!init||busy||done||scanning||saving)return;
+    $('hiddenNetwork').checked=true; $('hotspotMode').checked=true;
+    $('networks').value=''; selectedKey=''; savedSelectionPending=false;
+    controls(); $('ssid').focus();
+    message('请填写手机热点名称与密码；保存后立刻打开手机热点，iPhone 需先开启“最大兼容性”。');
 });
 $('ssid').addEventListener('input',()=>{$('pass').value='';});
 $('open').addEventListener('change',()=>{if($('open').checked)$('pass').value='';controls();});
@@ -116,14 +127,16 @@ $('config').addEventListener('submit',async e=>{
     e.preventDefault(); if(busy||done||scanning||saving)return;
     if(!token){message('设备尚未就绪，请稍候或刷新页面。','error');return;}
     if(!$('hiddenNetwork').checked){
-        if(!$('networks').value){message('请选择检测到的 Wi-Fi，或勾选“连接隐藏网络（手动输入名称）”。','error');return;}
+        if(!$('networks').value){message('请选择检测到的 Wi-Fi；列表里没有就点“我要连手机热点”或勾选手动输入。','error');return;}
         syncNetwork();
-    }else if(!$('ssid').value){message('请输入隐藏网络的 Wi-Fi 名称。','error');return;}
-    const body=new URLSearchParams({ssid:$('ssid').value,pass:$('open').checked?'':$('pass').value,open:$('open').checked?'1':'0'});
+    }else if(!$('ssid').value){message('请输入 Wi-Fi 名称（手机热点名或隐藏网络名）。','error');return;}
+    const blind=$('hotspotMode').checked&&$('hiddenNetwork').checked;
+    const body=new URLSearchParams({ssid:$('ssid').value,pass:$('open').checked?'':$('pass').value,open:$('open').checked?'1':'0',blind:blind?'1':'0'});
     saving=true; controls();
     try{
         const s=await json('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Portal-Token':token},body:body.toString()});
-        $('pass').value=''; lock(true); if(!done)message(s.message);
+        $('pass').value=''; lock(true);
+        if(!done)message(blind?'已保存！请现在打开手机热点（iPhone 记得开“最大兼容性”），设备约 3 秒后重启并自动连接。':s.message);
     }catch(err){if(!done)message(err.message,'error');}
     finally{saving=false;controls();}
 });
