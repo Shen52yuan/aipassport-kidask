@@ -58,6 +58,18 @@ static int frame_level(const int16_t *pcm, int samples) {
     return lvl > 100 ? 100 : lvl;
 }
 
+// 录音工作区约 6.4KB，必须放堆上：app 任务栈只有 16KB，而 libopus 编码、LVGL 与
+// 后续 mbedTLS 调用链同样吃栈。v0.1.2 曾把这组数组全放栈上，按住 OK 即触发
+// "Guru Meditation Error: Stack protection fault" 并整机重启。
+typedef struct {
+    int16_t  pcm[FRAME_SAMPLES];
+    uint8_t  opus[1275];                 // Opus 单包上限 1275 字节
+    uint8_t  page[PAGE_CAP];
+    uint8_t  pending_page[PAGE_CAP];     // 已封装、待落盘的上一页（eos=false，CRC 有效）
+    uint8_t  pending_pkt[1275];          // 上一页对应的 Opus 包（结尾重建 eos 页用）
+    uint8_t  hdr[128];
+} rec_ws_t;
+
 esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
                                bool (*should_stop)(void), void (*on_level)(int)) {
     *out_ogg = NULL;
@@ -72,27 +84,26 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
     kid_encoder_t enc = kid_encoder_create(KID_OPUS_BITRATE);
     if (!enc) return ESP_FAIL;
 
-    ogg_mux_t m;
-    ogg_mux_init(&m, esp_random());
-
-    grow_t g = {0};
-    uint8_t hdr[128];
-    int hn = ogg_mux_header_page(&m, hdr, sizeof(hdr));
-    if (hn < 0 || !grow_append(&g, hdr, (size_t)hn)) {
+    rec_ws_t *w = (rec_ws_t *)calloc(1, sizeof(*w));
+    if (!w) {
+        ESP_LOGE(TAG, "录音工作区分配失败 (需要 %u 字节)", (unsigned)sizeof(*w));
         kid_encoder_destroy(enc);
-        free(g.p);
         return ESP_ERR_NO_MEM;
     }
 
-    int16_t pcm[FRAME_SAMPLES];
-    uint8_t opus[1275];                 // Opus 单包上限 1275 字节
-    uint8_t page[PAGE_CAP];
-    uint8_t pending_page[PAGE_CAP];     // 已封装、待落盘的上一页（eos=false，CRC 有效）
-    int     pending_page_len = 0;
-    uint8_t pending_pkt[1275];          // 上一页对应的 Opus 包（结尾重建 eos 页用）
-    int     pending_pkt_len = 0;
-    ogg_mux_t m_before_pending;         // 封装上一页前的 muxer 状态快照
+    ogg_mux_t m, m_before_pending = {0};
+    ogg_mux_init(&m, esp_random());
+    grow_t g = {0};
+    int    pending_page_len = 0;
+    int    pending_pkt_len  = 0;
     const int per_pkt_samples = FRAME_SAMPLES * 3;   // 16k → 48k 粒度增量
+    esp_err_t ret = ESP_FAIL;
+
+    int hn = ogg_mux_header_page(&m, w->hdr, sizeof(w->hdr));
+    if (hn < 0 || !grow_append(&g, w->hdr, (size_t)hn)) {
+        ret = ESP_ERR_NO_MEM;
+        goto done;
+    }
 
     const int64_t t0 = esp_timer_get_time();
 
@@ -101,55 +112,59 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
         const int64_t now = esp_timer_get_time();
         if (now - t0 >= (int64_t)KID_REC_MAX_MS * 1000) break;
 
-        if (bsp_audio_read(pcm, FRAME_BYTES) != ESP_OK) {
+        if (bsp_audio_read(w->pcm, FRAME_BYTES) != ESP_OK) {
             // 瞬态读失败：跳过本帧，不计入时长。
             continue;
         }
-        if (on_level) on_level(frame_level(pcm, FRAME_SAMPLES));
+        if (on_level) on_level(frame_level(w->pcm, FRAME_SAMPLES));
 
-        int on = kid_encoder_encode(enc, pcm, FRAME_SAMPLES, opus, sizeof(opus));
+        int on = kid_encoder_encode(enc, w->pcm, FRAME_SAMPLES, w->opus, sizeof(w->opus));
         if (on <= 0) continue;
 
         // 上一页已封装完成（eos=false），先落盘。
-        if (pending_page_len > 0) {
-            if (!grow_append(&g, pending_page, (size_t)pending_page_len)) {
-                kid_encoder_destroy(enc);
-                free(g.p);
-                return ESP_ERR_NO_MEM;
-            }
+        if (pending_page_len > 0 &&
+            !grow_append(&g, w->pending_page, (size_t)pending_page_len)) {
+            ret = ESP_ERR_NO_MEM;
+            goto done;
         }
         // 封装当前页（eos=false），记录快照与源包，待下一轮落盘或结尾重建。
         m_before_pending = m;
-        int pn = ogg_mux_data_page(&m, opus, on, false, per_pkt_samples, page, sizeof(page));
+        int pn = ogg_mux_data_page(&m, w->opus, on, false, per_pkt_samples,
+                                   w->page, sizeof(w->page));
         if (pn < 0) continue;
-        memcpy(pending_page, page, (size_t)pn);
+        memcpy(w->pending_page, w->page, (size_t)pn);
         pending_page_len = pn;
-        memcpy(pending_pkt, opus, (size_t)on);
+        memcpy(w->pending_pkt, w->opus, (size_t)on);
         pending_pkt_len = on;
     }
 
-    kid_encoder_destroy(enc);
-
     const int64_t dur_ms = (esp_timer_get_time() - t0) / 1000;
     if (dur_ms < KID_REC_MIN_MS || pending_page_len == 0) {
-        free(g.p);
         ESP_LOGW(TAG, "录音过短(%lldms)或为空，丢弃", (long long)dur_ms);
-        return ESP_ERR_INVALID_STATE;
+        ret = ESP_ERR_INVALID_STATE;
+        goto done;
     }
 
     // 结尾：用快照重建最后一页并置 eos（重新计算 CRC，保证合法）。
     m = m_before_pending;
-    int pn = ogg_mux_data_page(&m, pending_pkt, pending_pkt_len, true, per_pkt_samples,
-                               page, sizeof(page));
-    if (pn < 0 || !grow_append(&g, page, (size_t)pn)) {
-        free(g.p);
-        return ESP_ERR_NO_MEM;
+    int pn = ogg_mux_data_page(&m, w->pending_pkt, pending_pkt_len, true, per_pkt_samples,
+                               w->page, sizeof(w->page));
+    if (pn < 0 || !grow_append(&g, w->page, (size_t)pn)) {
+        ret = ESP_ERR_NO_MEM;
+        goto done;
     }
 
     *out_ogg = g.p;
     *out_len = g.len;
+    g.p = NULL;                       // 所有权移交调用方
     ESP_LOGI(TAG, "录音完成: %lldms, Ogg %u 字节", (long long)dur_ms, (unsigned)g.len);
-    return ESP_OK;
+    ret = ESP_OK;
+
+done:
+    kid_encoder_destroy(enc);
+    free(w);
+    free(g.p);
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
