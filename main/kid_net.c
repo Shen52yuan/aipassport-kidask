@@ -1,13 +1,27 @@
 // main/kid_net.c —— KidAsk 网络：把整段 Ogg Opus 上行 POST 到自建端点，
 // 回收 X-Answer-Text / X-Asr-Text（URL 解码）与下行 Ogg Opus 音频主体。
 #include "kid_net.h"
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 
 static const char *TAG = "kid_net";
+
+/* v0.1.9：一次开机 = 一个会话。16 位十六进制随机串，服务端按此维护最近 3 轮
+   问答文本（纯内存、5 分钟超时、不存音频）。重启即换新 id，等于开新话题。 */
+static char s_session_id[17];
+
+void kid_net_init_session(void) {
+    const uint32_t a = esp_random();
+    const uint32_t b = esp_random();
+    snprintf(s_session_id, sizeof(s_session_id), "%08x%08x",
+             (unsigned)a, (unsigned)b);
+    ESP_LOGI(TAG, "会话 id 已生成: %s", s_session_id);
+}
 
 // Let's Encrypt / ISRG Root X1 信任锚（公开根证书，非敏感信息）。
 // 站点链: leaf -> YE2 -> Root YE -> ISRG Root X2 -> ISRG Root X1，
@@ -93,6 +107,12 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
             } else if (strcasecmp(ev->header_key, "X-Asr-Text") == 0) {
                 c->resp->asr_len = url_decode(ev->header_value, vlen,
                                               c->resp->asr, KID_ASR_CAP);
+            } else if (strcasecmp(ev->header_key, "X-Need-Retry") == 0) {
+                /* 服务端 v0.2.0：1 = 没听清 / 问题不完整，body 是童声引导提示音。 */
+                c->resp->need_retry = (ev->header_value[0] == '1');
+            } else if (strcasecmp(ev->header_key, "X-Retry-Reason") == 0) {
+                snprintf(c->resp->retry_reason, sizeof(c->resp->retry_reason),
+                         "%s", ev->header_value);
             } else if (strcasecmp(ev->header_key, "Content-Length") == 0) {
                 long n = strtol(ev->header_value, NULL, 10);
                 if (n > 0 && n <= 256 * 1024) c->expected_len = (size_t)n;
@@ -141,13 +161,20 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
 
     // 使用上方显式根证书做完整校验。
     esp_http_client_set_header(h, "Content-Type", "application/ogg");
+    /* v0.1.9：服务端按 session id 串起最近 3 轮问答；空 id 时服务端退化为单轮。
+       两端互不感知，可单独升级任意一端。 */
+    if (s_session_id[0]) {
+        esp_http_client_set_header(h, "X-Session-Id", s_session_id);
+    }
     esp_http_client_set_post_field(h, (const char *)ogg, (int)ogg_len);
 
     esp_err_t err = esp_http_client_perform(h);
     out->status = esp_http_client_get_status_code(h);
-    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB answer=%uB asr=%uB",
+    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB answer=%uB asr=%uB retry=%d(%s)",
              esp_err_to_name(err), out->status, (unsigned)c.len,
-             (unsigned)out->answer_len, (unsigned)out->asr_len);
+             (unsigned)out->answer_len, (unsigned)out->asr_len,
+             out->need_retry ? 1 : 0,
+             out->retry_reason[0] ? out->retry_reason : "-");
     if (err == ESP_OK) {
         out->audio = c.buf;
         out->audio_len = c.len;
