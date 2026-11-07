@@ -183,6 +183,12 @@ typedef struct {
     int           preskip;       // 剩余待丢弃的解码样本数（按解码 rate）
     int16_t      *pcm;
     int           pcm_cap;       // 解码缓冲容量（样本数/每通道）
+    // v0.1.7 诊断：用来一次判定「解码出的是真音频」还是「静音/没写进 I2S」。
+    uint32_t      packets;
+    uint32_t      decoded_samples;
+    uint32_t      written_bytes;
+    uint32_t      write_errors;
+    int32_t       peak;          // PCM16 绝对峰值，0 表示解码结果全静音
 } play_ctx_t;
 
 static void play_on_head(void *user, uint32_t rate, int channels, int preskip) {
@@ -209,6 +215,12 @@ static void play_on_packet(void *user, const uint8_t *data, int plen) {
 
     int n = kid_decoder_decode(c->dec, data, plen, c->pcm, c->pcm_cap);
     if (n <= 0) return;
+    c->packets++;
+    c->decoded_samples += (uint32_t)n;
+    for (int i = 0; i < n * c->ch; i++) {
+        int32_t v = c->pcm[i] < 0 ? -(int32_t)c->pcm[i] : (int32_t)c->pcm[i];
+        if (v > c->peak) c->peak = v;
+    }
 
     int skip = c->preskip;
     if (skip > n) skip = n;
@@ -222,15 +234,23 @@ static void play_on_packet(void *user, const uint8_t *data, int plen) {
     while (w < wb) {
         esp_err_t e = bsp_audio_write(src + w, wb - w);
         if (e != ESP_OK) {
+            c->write_errors++;
             ESP_LOGW(TAG, "播放写入中断: %s", esp_err_to_name(e));
             return;
         }
+        c->written_bytes += (uint32_t)(wb - w);
         w += (wb - w);   // esp_codec_dev_write 阻塞写满 data_size
     }
 }
 
 esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len) {
     if (!ogg || len == 0) return ESP_ERR_INVALID_ARG;
+
+    // ⚠ 必须在播放前设置输出音量：BSP 的 s_volume 静态变量默认 0（静音），
+    // 且 esp_codec_dev_open() 每次都会把它写进 ES8311 的 DAC 音量寄存器。
+    // v0.1.6 之前 KidAsk 从未调用过本函数，PCM 全部写出但喇叭无声。
+    // 这里再设一次也能兜住 BSP 失败回滚（audio_reset_state 会把 s_volume 清零）。
+    bsp_audio_set_volume(KID_VOLUME);
 
     play_ctx_t c = {0};
     ogg_demux_ret_t r = ogg_demux_parse(ogg, (int)len, &c, play_on_head, play_on_packet);
@@ -247,6 +267,9 @@ esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len) {
     }
     kid_decoder_destroy(c.dec);
     free(c.pcm);
-    ESP_LOGI(TAG, "播放完成 (rate=%u ch=%u)", c.rate, c.ch);
+    ESP_LOGI(TAG, "播放完成 (rate=%u ch=%u vol=%d pkts=%u samples=%u bytes=%u peak=%d werr=%u)",
+             c.rate, c.ch, KID_VOLUME, (unsigned)c.packets,
+             (unsigned)c.decoded_samples, (unsigned)c.written_bytes,
+             (int)c.peak, (unsigned)c.write_errors);
     return ESP_OK;
 }
