@@ -35,5 +35,9 @@ esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len);
 // 用来一次区分「音量被重置」与「硬件/寄存器级静音」。由 app_main() 调用。
 void kid_audio_selftest(void);
 
+// v0.1.9：短促「嘀」提示音（非语音），用于错误页/网络异常的听觉反馈。
+// 「没听清请补充」的童声语音引导由服务端 X-Need-Retry 分支提供，不走这里。
+void kid_audio_beep(int count);
+
 // 通过共享 I2C 总线回读 ES8311 寄存器（0x32=DAC 音量、0x31/0x37=静音/输出控制）。
 void kid_audio_dump_regs(const char *tag);
