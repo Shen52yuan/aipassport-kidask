@@ -23,8 +23,8 @@ typedef struct {
 // 初始化封装器。serial 建议用 esp_random() 生成，保证与同机其它流不冲突。
 void ogg_mux_init(ogg_mux_t *m, uint32_t serial);
 
-// 构造首页面（bos 标志）：内含 OpusHead + OpusTags 两个包。
-// out 容量需 ≥ 128 字节。返回写入字节数，失败返回 < 0。
+// 构造头部两页：第 0 页 BOS 仅含 OpusHead，第 1 页仅含 OpusTags（RFC 7845）。
+// out 容量需 ≥ 192 字节。返回两页总字节数，失败返回 < 0。
 int ogg_mux_header_page(ogg_mux_t *m, uint8_t *out, size_t out_cap);
 
 // 构造一个数据页面：把一个 Opus 数据包封装成一页。
