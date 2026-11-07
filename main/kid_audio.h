@@ -12,6 +12,11 @@
 #define KID_REC_MAX_MS   10000   // 单次录音上限（任务卡 ≤10s）
 #define KID_REC_MIN_MS   300     // 过短视为误触，丢弃不发送
 
+// ES8311 输出音量 0..100。⚠ BSP 内部 s_volume 是静态变量，默认 0（= 静音），
+// 且 bsp_audio_set_format() 每次 open 都会把它写进 codec。必须显式设置，
+// 否则 PCM 全部写进 I2S 但喇叭一点声音都没有（v0.1.6 实机现象）。
+#define KID_VOLUME       85
+
 // 录音 → Opus 编码 → Ogg Opus 封装。
 // 成功时 *out_ogg 指向堆分配缓冲区（调用方 free()），*out_len 为字节数，返回 ESP_OK。
 // 录音过短（< KID_REC_MIN_MS）返回 ESP_ERR_INVALID_STATE，不分配。
