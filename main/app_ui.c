@@ -56,6 +56,15 @@ static portal_stage_t s_prov_last;
 // 设置页
 static lv_obj_t *s_rows_set[3];
 
+static uint32_t tone_color(ui_tone_t t) {
+    switch (t) {
+    case UI_TONE_OK:    return C_TEAL;
+    case UI_TONE_WARN:  return C_AMBER;
+    case UI_TONE_ERROR: return C_RED;
+    default:            return C_SKY;
+    }
+}
+
 static uint32_t kid_state_color(kid_ui_state_t st) {
     switch (st) {
     case KID_UI_RECORD:  return C_TEAL;
