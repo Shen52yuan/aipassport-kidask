@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define APP_UI_LIST_ROWS 5
 
