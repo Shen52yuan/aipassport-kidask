@@ -138,6 +138,9 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
 
     esp_err_t err = esp_http_client_perform(h);
     out->status = esp_http_client_get_status_code(h);
+    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB answer=%uB asr=%uB",
+             esp_err_to_name(err), out->status, (unsigned)c.len,
+             (unsigned)out->answer_len, (unsigned)out->asr_len);
     if (err == ESP_OK) {
         out->audio = c.buf;
         out->audio_len = c.len;
