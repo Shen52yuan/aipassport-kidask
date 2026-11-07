@@ -13,8 +13,6 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "qca_pat.h"
-#include "qca_voice.h"
 
 static const char *TAG = "app_wifi";
 
@@ -29,12 +27,12 @@ static const char *TAG = "app_wifi";
 #define RETRY_BACKOFF_MIN_MS 1200
 #define RETRY_BACKOFF_MAX_MS 3000
 
-#define NVS_NS        "qca_app"
+#define NVS_NS        "kidask"
 #define NVS_KEY_PROV  "prov"
 #define NVS_KEY_RESET "reset"
 // 应用命名空间里的 Wi-Fi 凭据镜像。IDF 驱动的 WIFI_STORAGE_FLASH 持久化在本设备
 // 实测中重启后会丢失 STA 配置（保存返回 ESP_OK，下次开机 ssid_len=0），而同一
-// qca_app 命名空间的 PAT 却能可靠保留，故用镜像兜底。键名 ≤15 字符（NVS 限制）。
+// kidask 命名空间却能可靠保留，故用镜像兜底。键名 ≤15 字符（NVS 限制）。
 #define NVS_KEY_SSID  "wifi_ssid"
 #define NVS_KEY_PASS  "wifi_pass"
 // 上次连通时 AP 的主信道（2.4G 1~13）。按 IDF 定义它只是「扫描起点」提示
@@ -213,7 +211,7 @@ bool app_wifi_is_connected(void) {
 }
 
 // ---------------- 应用 NVS 的 Wi-Fi 凭据镜像 ----------------
-// 见 NVS_KEY_SSID 注释：IDF 驱动持久化不可靠时用 qca_app 兜底。密码以明文存于
+// 见 NVS_KEY_SSID 注释：IDF 驱动持久化不可靠时用 kidask 兜底。密码以明文存于
 // NVS，与既有 PAT 及 IDF wifi NVS 的存储强度一致（本机未启用 Flash/NVS 加密）；
 // 所有日志只记录长度与返回码，绝不记录 SSID/密码内容。栈上副本用完立即清零。
 esp_err_t app_wifi_save_creds(const char *ssid, const char *pass) {
@@ -397,8 +395,6 @@ esp_err_t app_wifi_finish_factory_reset(void) {
     if (e == ESP_OK) e = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     if (e == ESP_OK) e = esp_wifi_restore(); // IDF 官方 API：只重置 Wi-Fi 持久设置
     if (e == ESP_OK) e = app_wifi_clear_creds(); // 同时清除应用 NVS 的 Wi-Fi 凭据镜像
-    if (e == ESP_OK) e = qca_pat_use("", true);
-    if (e == ESP_OK) e = qca_voice_reset_volume();
     if (e != ESP_OK) return e; // 意图尚在，下次开机/本页重试继续，不能回普通流程
     nvs_handle_t h;
     e = nvs_open(NVS_NS, NVS_READWRITE, &h);
