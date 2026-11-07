@@ -81,8 +81,10 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
         return e;
     }
 
+    ESP_LOGI(TAG, "创建 Opus 编码器 ...");
     kid_encoder_t enc = kid_encoder_create(KID_OPUS_BITRATE);
     if (!enc) return ESP_FAIL;
+    ESP_LOGI(TAG, "Opus 编码器就绪，进入录音循环");
 
     rec_ws_t *w = (rec_ws_t *)calloc(1, sizeof(*w));
     if (!w) {
@@ -153,6 +155,10 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
         ret = ESP_ERR_NO_MEM;
         goto done;
     }
+
+    // grow_append 按 2 倍扩容，交付前收缩到实际长度，避免上行期间白占一倍堆。
+    uint8_t *tight = (uint8_t *)realloc(g.p, g.len);
+    if (tight) g.p = tight;
 
     *out_ogg = g.p;
     *out_len = g.len;
