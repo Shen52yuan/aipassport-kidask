@@ -42,6 +42,13 @@ static const char *TAG = "main";
 #define WIFI_TIMEOUT_MS   35000
 #define LIST_PAGE_STEP    5
 
+// libopus 的 opus_encode() 会在运行期用 alloca 连续切走约 20KB 栈， HTTPS 阶段
+// 又叠加 Ogg/TLS/响应缓冲，逐段记录内存水位以便实机定位瓶颈。
+#define LOG_MEM(where) ESP_LOGI(TAG, "[mem] %-10s heap=%u min=%u stack_left=%u", \
+    where, (unsigned)esp_get_free_heap_size(), \
+    (unsigned)esp_get_minimum_free_heap_size(), \
+    (unsigned)uxTaskGetStackHighWaterMark(NULL))
+
 typedef struct {
     bsp_btn_t     btn;
     bsp_btn_ev_t  event;
@@ -292,6 +299,7 @@ static void show_error(const char *msg) {
 
 static void run_ask(void) {
     ESP_LOGI(TAG, "开始问答: 录音 → 上传 → 播放");
+    LOG_MEM("ask_start");
     app_ui_set_state(KID_UI_RECORD, NULL);
     s_record_stop = false;
 
@@ -309,12 +317,15 @@ static void run_ask(void) {
         show_error("录音出问题了");
         return;
     }
+    LOG_MEM("rec_done");
 
     // 上行 → 服务器。
     app_ui_set_state(KID_UI_THINK, NULL);
     kid_resp_t resp = {0};
+    LOG_MEM("pre_http");
     esp_err_t pe = kid_net_post_ogg(ogg, ogg_len, &resp);
     free(ogg);
+    LOG_MEM("http_done");
     flush_keys();
 
     if (pe != ESP_OK) {
@@ -325,6 +336,7 @@ static void run_ask(void) {
     if (resp.status == 200 && resp.audio && resp.audio_len) {
         app_ui_set_state(KID_UI_ANSWER, resp.answer_len ? resp.answer : NULL);
         kid_audio_play_ogg(resp.audio, resp.audio_len);
+        LOG_MEM("play_done");
         kid_resp_free(&resp);
         return;
     }
@@ -430,7 +442,9 @@ void app_main(void) {
 
     // 16KB：本任务串行跑「录音 → libopus 编码 → HTTPS/TLS 握手 → Opus 解码播放」，
     // 8192 字节在按住 OK 进入编码时触发过 Stack protection fault（v0.1.2 实机日志）。
-    if (xTaskCreate(app_task, "app", 16384, NULL, 4, NULL) != pdPASS) {
+    // libopus 的 SILK/CELT 编码链用 alloca 动态切栈（实测峰值 >20KB），16KB 会触发
+    // "Stack protection fault" 整机重启；32KB 留出余量，堆侧由 LOG_MEM 逐段监控。
+    if (xTaskCreate(app_task, "app", 32768, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "应用任务创建失败");
     }
     ESP_LOGI(TAG, "就绪:Button=%d Audio=%d 剩余堆 %u", button_err == ESP_OK, s_audio_ok,
