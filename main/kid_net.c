@@ -81,15 +81,22 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
     net_ctx_t *c = (net_ctx_t *)ev->user_data;
     switch (ev->event_id) {
     case HTTP_EVENT_ON_HEADER:
-        if (strcasecmp(ev->header_key, "X-Answer-Text") == 0) {
-            c->resp->answer_len = url_decode(ev->header_value, ev->data_len,
-                                             c->resp->answer, KID_ANSWER_CAP);
-        } else if (strcasecmp(ev->header_key, "X-Asr-Text") == 0) {
-            c->resp->asr_len = url_decode(ev->header_value, ev->data_len,
-                                          c->resp->asr, KID_ASR_CAP);
-        } else if (strcasecmp(ev->header_key, "Content-Length") == 0) {
-            long n = strtol(ev->header_value, NULL, 10);
-            if (n > 0 && n <= 256 * 1024) c->expected_len = (size_t)n;
+        // ⚠ esp_http_client 的 ON_HEADER 事件里 ev->data_len 恒为 0：头值是
+        // NUL 结尾字符串，长度并不通过 data_len 传递。v0.1.6 误用 data_len
+        // 作 url_decode 的长度，解出 0 字节，屏幕要点卡片因此一直空白。
+        if (ev->header_key && ev->header_value) {
+            const size_t vlen = strlen(ev->header_value);
+            if (strcasecmp(ev->header_key, "X-Answer-Text") == 0) {
+                c->resp->answer_len = url_decode(ev->header_value, vlen,
+                                                 c->resp->answer, KID_ANSWER_CAP);
+                ESP_LOGI(TAG, "收到屏幕要点: %u 字节", (unsigned)c->resp->answer_len);
+            } else if (strcasecmp(ev->header_key, "X-Asr-Text") == 0) {
+                c->resp->asr_len = url_decode(ev->header_value, vlen,
+                                              c->resp->asr, KID_ASR_CAP);
+            } else if (strcasecmp(ev->header_key, "Content-Length") == 0) {
+                long n = strtol(ev->header_value, NULL, 10);
+                if (n > 0 && n <= 256 * 1024) c->expected_len = (size_t)n;
+            }
         }
         break;
     case HTTP_EVENT_ON_DATA:
