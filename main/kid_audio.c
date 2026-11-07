@@ -4,10 +4,13 @@
 // Ogg 已落内存（服务端≤70KB），逐包解码直放。Opus 编解码直接调用 78/esp-opus 核心库。
 #include "kid_audio.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "bsp_audio.h"
+#include "bsp_i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -188,6 +191,7 @@ typedef struct {
     uint32_t      decoded_samples;
     uint32_t      written_bytes;
     uint32_t      write_errors;
+    uint32_t      vol_sets;      // v0.1.8：播放链路里实际重设 ES8311 音量的次数
     int32_t       peak;          // PCM16 绝对峰值，0 表示解码结果全静音
 } play_ctx_t;
 
@@ -204,6 +208,15 @@ static void play_on_head(void *user, uint32_t rate, int channels, int preskip) {
     // 解码目标采样率 = OpusHead 声明的 rate；本机服务器约定 16k。
     esp_err_t e = bsp_audio_set_format(rate, 16, c->ch);
     if (e != ESP_OK) ESP_LOGE(TAG, "播放采样格式设置失败: %s", esp_err_to_name(e));
+
+    // ⚠ v0.1.8：上游 qca_voice 的顺序是 set_format() 之后才 set_volume()。
+    // 只在 open 之前设 s_volume 不够：codec 打开/重配 DAC 后音量会被打回默认，
+    // 表现是 PCM 全写进 I2S（werr=0、peak 正常）但喇叭无声。此时 s_opened 已为
+    // true，setter 会真正写 ES8311 的 DAC 音量寄存器。
+    bsp_audio_set_volume(KID_VOLUME);
+    c->vol_sets++;
+    ESP_LOGI(TAG, "播放前重设输出音量 %d%% (set_format=%s)", KID_VOLUME, esp_err_to_name(e));
+
     // 每 20ms 帧：最大 48k*0.12s ≈ 5760 样本；留 8k 余量。
     c->pcm_cap = 8192;
     c->pcm = malloc((size_t)c->pcm_cap * c->ch * 2);
@@ -212,6 +225,13 @@ static void play_on_head(void *user, uint32_t rate, int channels, int preskip) {
 static void play_on_packet(void *user, const uint8_t *data, int plen) {
     play_ctx_t *c = (play_ctx_t *)user;
     if (!c->dec || !c->pcm || plen <= 0) return;
+
+    // v0.1.8：首个包写入前再设一次。esp_codec_dev_write() 首次调用可能触发
+    // codec 内部 lazy 配置并重置 DAC 音量，这一下兜住该路径。
+    if (c->packets == 0) {
+        bsp_audio_set_volume(KID_VOLUME);
+        c->vol_sets++;
+    }
 
     int n = kid_decoder_decode(c->dec, data, plen, c->pcm, c->pcm_cap);
     if (n <= 0) return;
@@ -267,9 +287,73 @@ esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len) {
     }
     kid_decoder_destroy(c.dec);
     free(c.pcm);
-    ESP_LOGI(TAG, "播放完成 (rate=%u ch=%u vol=%d pkts=%u samples=%u bytes=%u peak=%d werr=%u)",
-             c.rate, c.ch, KID_VOLUME, (unsigned)c.packets,
+    ESP_LOGI(TAG, "播放完成 (rate=%u ch=%u vol=%d volset=%u pkts=%u samples=%u bytes=%u peak=%d werr=%u)",
+             c.rate, c.ch, KID_VOLUME, (unsigned)c.vol_sets, (unsigned)c.packets,
              (unsigned)c.decoded_samples, (unsigned)c.written_bytes,
              (int)c.peak, (unsigned)c.write_errors);
+    kid_audio_dump_regs("play_done");
     return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.8 诊断：ES8311 寄存器回读 + 开机自检音
+// ---------------------------------------------------------------------------
+void kid_audio_dump_regs(const char *tag) {
+    i2c_master_bus_handle_t bus = bsp_i2c_bus();
+    if (!bus) {
+        ESP_LOGW(TAG, "[%s] I2C 总线未就绪，跳过寄存器回读", tag);
+        return;
+    }
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = 0x18,          // ES8311 7-bit 地址（见 bsp_i2c.h）
+        .scl_speed_hz    = 100000,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    if (i2c_master_bus_add_device(bus, &cfg, &dev) != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] ES8311 设备句柄创建失败", tag);
+        return;
+    }
+    // 0x32 = DAC 音量；0x31/0x37 = DAC 静音与输出控制；其余为电源/时钟状态。
+    static const uint8_t regs[] = {0x0D, 0x0E, 0x12, 0x31, 0x32, 0x37, 0x45};
+    char line[128];
+    int off = 0;
+    for (size_t i = 0; i < sizeof(regs) && off < (int)sizeof(line) - 12; i++) {
+        uint8_t r = regs[i], v = 0;
+        esp_err_t e = i2c_master_transmit_receive(dev, &r, 1, &v, 1, 200);
+        off += snprintf(line + off, sizeof(line) - off, " %02X=%02X%s",
+                        r, v, e == ESP_OK ? "" : "!");
+    }
+    ESP_LOGI(TAG, "[%s] ES8311 regs:%s", tag, line);
+    i2c_master_bus_rm_device(dev);
+}
+
+// 16 点正弦表：16kHz 采样率时每周期 16 样本 = 1kHz，幅度 ±12000。
+static const int16_t k_sine1k[16] = {
+        0,  4595,  8505, 11100, 12000, 11100,  8505,  4595,
+        0, -4595, -8505, -11100, -12000, -11100, -8505, -4595
+};
+
+void kid_audio_selftest(void) {
+    ESP_LOGI(TAG, "=== 音频自检开始: 1kHz / 1s / 音量 %d%% ===", KID_VOLUME);
+    esp_err_t e = bsp_audio_set_format(16000, 16, 1);
+    ESP_LOGI(TAG, "自检 set_format: %s", esp_err_to_name(e));
+    bsp_audio_set_volume(KID_VOLUME);
+    kid_audio_dump_regs("selftest_before");
+
+    static int16_t buf[800];              // 1600B = 50ms @16k/mono，静态区避免占任务栈
+    uint32_t bytes = 0, errs = 0;
+    for (int block = 0; block < 20; block++) {
+        for (int i = 0; i < 800; i++) buf[i] = k_sine1k[(block * 800 + i) & 15];
+        bsp_audio_set_volume(KID_VOLUME); // 兜住 esp_codec_dev 的 lazy 重配
+        esp_err_t w = bsp_audio_write(buf, sizeof(buf));
+        if (w != ESP_OK) {
+            errs++;
+            ESP_LOGW(TAG, "自检写入失败: %s", esp_err_to_name(w));
+        } else {
+            bytes += sizeof(buf);
+        }
+    }
+    ESP_LOGI(TAG, "=== 音频自检结束: 写入 %u 字节, 错误 %u ===", (unsigned)bytes, (unsigned)errs);
+    kid_audio_dump_regs("selftest_after");
 }
