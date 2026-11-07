@@ -44,7 +44,7 @@ jobs:
 
       - name: Set artifact name
         id: artifact_name
-        run: echo "name=passport-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+        run: echo "name=kidask-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -69,11 +69,11 @@ jobs:
       - name: Rename release asset
         run: |
           mv release/FoloToy-AI-Passport-full.bin \
-             "release/Qoder-Passport-${GITHUB_REF_NAME}-esp32c3-full.bin"
+             "release/Aipassport-KidAsk-${GITHUB_REF_NAME}-esp32c3-full.bin"
 
       - name: Create release (tag push)
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: "${{ github.ref_name }}"
-          files: release/Qoder-Passport-${{ github.ref_name }}-esp32c3-full.bin
+          files: release/Aipassport-KidAsk-${{ github.ref_name }}-esp32c3-full.bin
           fail_on_unmatched_files: true
