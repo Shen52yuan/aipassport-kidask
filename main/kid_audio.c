@@ -67,7 +67,7 @@ typedef struct {
     uint8_t  page[PAGE_CAP];
     uint8_t  pending_page[PAGE_CAP];     // 已封装、待落盘的上一页（eos=false，CRC 有效）
     uint8_t  pending_pkt[1275];          // 上一页对应的 Opus 包（结尾重建 eos 页用）
-    uint8_t  hdr[128];
+    uint8_t  hdr[192];      // 头部两页（BOS OpusHead + OpusTags）合计约 115 字节
 } rec_ws_t;
 
 esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
