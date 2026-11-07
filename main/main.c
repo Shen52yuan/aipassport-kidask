@@ -291,6 +291,7 @@ static void show_error(const char *msg) {
 }
 
 static void run_ask(void) {
+    ESP_LOGI(TAG, "开始问答: 录音 → 上传 → 播放");
     app_ui_set_state(KID_UI_RECORD, NULL);
     s_record_stop = false;
 
@@ -363,6 +364,8 @@ static void app_task(void *arg) {
     for (;;) {
         ensure_wifi();
         app_ui_set_state(KID_UI_IDLE, NULL);
+        ESP_LOGI(TAG, "待机就绪, app 栈历史最低余量=%u",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
         input_event_t k;
         bool rec = false;
@@ -370,7 +373,8 @@ static void app_task(void *arg) {
         while (wait_key(&k, -1)) {
             if (k.btn == BSP_BTN_OK && k.event == BSP_BTN_PRESS) { rec = true; break; }
             if (k.btn == BSP_BTN_OK && k.event == BSP_BTN_LONG) { settings_menu(false); break; }
-            // 忽略 UP/DOWN 等无关事件
+            // 待机页其余按键给一次可见反馈，避免被误认为死机。
+            app_ui_toast("按住 OK 键说话");
         }
         if (!rec) continue;   // 设置完成 → 重新显示待机页
         run_ask();
@@ -424,7 +428,9 @@ void app_main(void) {
     if (bsp_battery_init() != ESP_OK) ESP_LOGW(TAG, "电量计不可用");
     s_input_ready = true;
 
-    if (xTaskCreate(app_task, "app", 8192, NULL, 4, NULL) != pdPASS) {
+    // 16KB：本任务串行跑「录音 → libopus 编码 → HTTPS/TLS 握手 → Opus 解码播放」，
+    // 8192 字节在按住 OK 进入编码时触发过 Stack protection fault（v0.1.2 实机日志）。
+    if (xTaskCreate(app_task, "app", 16384, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "应用任务创建失败");
     }
     ESP_LOGI(TAG, "就绪:Button=%d Audio=%d 剩余堆 %u", button_err == ESP_OK, s_audio_ok,
