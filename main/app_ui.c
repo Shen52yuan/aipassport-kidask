@@ -469,7 +469,8 @@ void app_ui_show_provision(void) {
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 45);
 
     if (app_portal_stage() != PORTAL_ERROR) {
-        char data[96];
+        // 口令固定后仍允许编译期自定义（最长 63 字节），留足二维码容量。
+        char data[192];
         snprintf(data, sizeof(data), "WIFI:T:WPA;S:%s;P:%s;;",
                  app_portal_ssid(), app_portal_password());
         lv_obj_t *qr = lv_qrcode_create(scr);
@@ -482,7 +483,7 @@ void app_ui_show_provision(void) {
         lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 72);
         lv_obj_t *ssid = mk_label(scr, &lv_font_montserrat_14, C_TEXT, app_portal_ssid());
         lv_obj_align(ssid, LV_ALIGN_TOP_MID, 0, 194);
-        char password[64];
+        char password[96];
         snprintf(password, sizeof(password), "热点密码：%s", app_portal_password());
         lv_obj_t *pw = mk_label(scr, app_font_text(), C_DIM, password);
         lv_obj_align(pw, LV_ALIGN_TOP_MID, 0, 215);
