@@ -1,13 +1,14 @@
 // main/main.c —— 「Aipassport-KidAsk」：巴掌大、靠手机热点联网的小学生 AI 问答机。
 //
-// 交互极简：待机（按住 OK 说话）→ 录音 → Ogg Opus 上行 → 服务器 ASR+DeepSeek(儿童
-// prompt)+TTS → Ogg Opus 童声下行 + 屏幕要点 → 播放。彻底去除 QCA/PAT 云端实时语音通道。
+// 交互极简（v0.1.10 起改为「一按一说」）：待机按一下 OK 开始录音 → 说完再按一下
+// OK 发送 → Ogg Opus 上行 → 服务器 ASR+DeepSeek(儿童 prompt)+TTS → Ogg Opus 童声
+// 下行 + 屏幕要点 → 播放。彻底去除 QCA/PAT 云端实时语音通道。
 //
 // 按键（全局统一，三键共用 ADC 分压，见 bsp_pins.h）：
-//   ▲/▼ 单击   设置页移动选中项（双击 ±2，长按一页）
-//   OK  按住   录音（PRESS 开始 / RELEASE 发送；≤10s 自动结束）
+//   ▲/▼ 单击   设置页移动选中项（双击 ±2，长按一页）；录音中 → 取消本次录音
+//   OK  单击   待机页 → 开始录音；录音中 → 结束并发送；错误页 → 返回待机
 //   OK  长按   待机页 / 配置页 → 设备设置；设置页 → 返回
-//   OK  单击   错误页 / 回答页 → 返回待机
+//   录音上限   ≤10s 自动结束并发送（不用一直按住，孩子可以自然说话）
 //
 // 线程：app_task 串行跑完整流程（阻塞 HTTPS 只在这里做）；按键回调只入队；界面由
 // app_ui 内部持 LVGL 锁绘制。
@@ -62,8 +63,9 @@ static bool          s_audio_ok;
 #define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
 static key_guard_t s_key_guard;
 
-// 录音停止标志：由按键 RELEASE 置位，ask_should_stop 轮询。
-static bool s_record_stop;
+// v0.1.10：录音停止/取消标志。停止＝第二次按 OK（发送）；取消＝▲/▼ 或长按（丢弃）。
+static volatile bool s_record_stop;
+static volatile bool s_record_cancel;
 
 // ---------- 按键 ----------
 // button 回调运行在共享 esp_timer 任务；只入队并立即返回。
@@ -132,13 +134,25 @@ static void wait_ok_any(void) {
     }
 }
 
-// 录音停止检测：排水输入队列，捕获 OK RELEASE；丢弃其余事件避免泄漏到待机页。
+// v0.1.10 录音停止检测：排水输入队列，捕获「第二次按 OK」并发送。
+// 不再以 RELEASE 为停止信号 —— 那样等于「按住说话」，孩子必须一直按着，
+// 松手瞬间还会切掉尾字。现在第一次按 OK 只是开录，松手继续录，第二次按下才收尾。
 static bool ask_should_stop(void) {
     input_event_t k;
     while (xQueueReceive(s_input_queue, &k, 0) == pdTRUE) {
-        if (k.btn == BSP_BTN_OK && k.event == BSP_BTN_RELEASE) s_record_stop = true;
+        if (k.event == BSP_BTN_LONG) {
+            // 长按任意键：放弃本次录音（长按 OK 在待机页是「设备设置」，不抢它的语义）
+            s_record_cancel = true;
+        } else if (k.btn == BSP_BTN_OK) {
+            // PRESS 一到就收尾，响应最快；CLICK/DOUBLE 兜住不同驱动的事件投递差异。
+            if (k.event == BSP_BTN_PRESS || k.event == BSP_BTN_CLICK ||
+                k.event == BSP_BTN_DOUBLE) s_record_stop = true;
+        } else if (k.btn == BSP_BTN_UP || k.btn == BSP_BTN_DOWN) {
+            s_record_cancel = true;
+        }
+        // 其余事件（RELEASE 等）一律丢弃，避免泄漏到待机页。
     }
-    return s_record_stop;
+    return s_record_stop || s_record_cancel;
 }
 
 static void ask_on_level(int level) { app_ui_set_level(level); }
@@ -293,22 +307,33 @@ static void ensure_wifi(void) {
 
 // ---------- 一次问答：录音 → 上传 → 播放 ----------
 static void show_error(const char *msg) {
-    // v0.1.9：错误页补一个听觉反馈（网络/限流类错误仍以屏幕文字为主；
-    // 「没听清请补充」的童声语音引导由服务端 X-Need-Retry 分支提供）。
-    kid_audio_beep(2);
+    // 三声短「嘀」：错误页必须给听觉反馈，否则一年级孩子根本不会低头看屏。
+    // 注意这不是语音；「没听清请补充」的童声引导由服务端 X-Need-Retry 分支提供。
+    kid_audio_beep(3);
     app_ui_set_state(KID_UI_ERROR, msg);
     wait_ok_any();
 }
 
 static void run_ask(void) {
-    ESP_LOGI(TAG, "开始问答: 录音 → 上传 → 播放");
+    ESP_LOGI(TAG, "开始问答: 按 OK 开录 → 再按 OK 发送 → 上传 → 播放");
     LOG_MEM("ask_start");
     app_ui_set_state(KID_UI_RECORD, NULL);
-    s_record_stop = false;
+    s_record_stop   = false;
+    s_record_cancel = false;
+    // 触发本次录音的那次短按会连带投递 PRESS/RELEASE/CLICK，先排空，否则
+    // 录音一开始就会被同一次按键的残留事件立刻停掉。
+    flush_keys();
 
     uint8_t *ogg = NULL;
     size_t   ogg_len = 0;
     esp_err_t re = kid_audio_record_ogg(&ogg, &ogg_len, ask_should_stop, ask_on_level);
+    if (s_record_cancel) {
+        free(ogg);
+        ESP_LOGI(TAG, "本次录音已取消");
+        app_ui_toast("已取消，按 OK 重新说");
+        flush_keys();
+        return;
+    }
     if (re == ESP_ERR_INVALID_STATE) {
         free(ogg);
         app_ui_toast("没听清，再试一次");
@@ -322,53 +347,77 @@ static void run_ask(void) {
     }
     LOG_MEM("rec_done");
 
-    // 上行 → 服务器。
-    app_ui_set_state(KID_UI_THINK, NULL);
-    kid_resp_t resp = {0};
-    LOG_MEM("pre_http");
-    esp_err_t pe = kid_net_post_ogg(ogg, ogg_len, &resp);
-    free(ogg);
-    LOG_MEM("http_done");
-    flush_keys();
+    // v0.1.10：服务端日志证实每次都 200 且完整下发了音频（12KB~56KB），但设备
+    // 偶发「有文案、没声音」。旧代码有两个静默失败点：kid_net_post_ogg() 在
+    // transport err 时把已收到的 body 全部 free；kid_audio_play_ogg() 的返回值
+    // 无人检查。现在以「音频完整 + 解码播放成功」为成功条件，缺失自动重发一次，
+    // 并把每次实收/期望/传输状态打进串口，杜绝哑掉。
+    for (int attempt = 0; attempt < 2; attempt++) {
+        app_ui_set_state(KID_UI_THINK, NULL);
+        kid_resp_t resp = {0};
+        LOG_MEM("pre_http");
+        esp_err_t pe = kid_net_post_ogg(ogg, ogg_len, &resp);
+        LOG_MEM("http_done");
+        flush_keys();
 
-    if (pe != ESP_OK) {
-        show_error("网络开小差了");
-        return;
-    }
-
-    if (resp.status == 200 && resp.audio && resp.audio_len) {
-        const bool need_retry = resp.need_retry;
-        // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
-        // need_retry 时服务端下发的 answer 本身就是引导语（如「我没听清楚…」），
-        // 直接显示即可；孩子听完提示音回待机，按 OK 再说一遍。
-        const char *card = resp.answer_len ? resp.answer
-                         : (resp.asr_len ? resp.asr : "正在读给你听~");
-        ESP_LOGI(TAG, "屏幕要点 %u 字节 / ASR %u 字节 / 需补充=%d(%s)",
-                 (unsigned)resp.answer_len, (unsigned)resp.asr_len,
-                 need_retry ? 1 : 0,
+        const bool complete  = (resp.content_len == 0) ||
+                               (resp.audio_len >= resp.content_len);
+        const bool has_audio = resp.status == 200 && resp.audio &&
+                               resp.audio_len >= 64 && complete;
+        ESP_LOGI(TAG, "第%d次应答: pe=%s status=%d 音频=%uB/%uB 完整=%d 文案=%uB 补充=%d(%s)",
+                 attempt + 1, esp_err_to_name(pe), resp.status,
+                 (unsigned)resp.audio_len, (unsigned)resp.content_len, complete ? 1 : 0,
+                 (unsigned)resp.answer_len, resp.need_retry ? 1 : 0,
                  resp.retry_reason[0] ? resp.retry_reason : "-");
-        app_ui_set_state(KID_UI_ANSWER, card);
-        kid_audio_play_ogg(resp.audio, resp.audio_len);
-        LOG_MEM("play_done");
+        if (resp.answer_len) ESP_LOGI(TAG, "屏幕文案: %s", resp.answer);
+
+        if (has_audio) {
+            // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
+            // need_retry 时服务端下发的 answer 本身就是引导语（如「我没听清楚…」）。
+            const char *card = resp.answer_len ? resp.answer
+                             : (resp.asr_len ? resp.asr : "正在读给你听~");
+            app_ui_set_state(KID_UI_ANSWER, card);
+            esp_err_t play = kid_audio_play_ogg(resp.audio, resp.audio_len);
+            LOG_MEM("play_done");
+            const bool need_retry = resp.need_retry;
+            kid_resp_free(&resp);
+            free(ogg);
+            if (play == ESP_OK) {
+                // need_retry：播完童声引导回待机等补充，session 不变，下一轮 POST
+                // 带着这一轮引导语作为上下文来理解孩子的补充说明。
+                vTaskDelay(pdMS_TO_TICKS(need_retry ? 2000 : 3000));
+                return;
+            }
+            ESP_LOGE(TAG, "下行 Ogg 解码/播放失败，不再静默放过");
+            show_error("声音没放出来，按 OK 再问一次");
+            return;
+        }
+
+        const int st = resp.status;
         kid_resp_free(&resp);
-        // need_retry：播完提示音就回待机等待补充。session id 不变，下一轮 POST
-        // 会带着这一轮的引导语作为上下文，服务端据此理解孩子的补充说明。
-        // 正常答案则多留 3 秒让孩子/家长看清屏幕文字。
-        vTaskDelay(pdMS_TO_TICKS(need_retry ? 2000 : 3000));
+        if (attempt == 0 && (st == 200 || st == 0)) {
+            // 传输被截断 / 连接提前关闭：同一段录音原样重发一次，服务端重新生成
+            // 答案音频。只在异常路径发生，不影响正常问答耗时。
+            ESP_LOGW(TAG, "下行音频缺失或不完整，0.5s 后自动重发一次");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        free(ogg);
+        if (st == 0 || st == 200) {
+            show_error("声音没收到，按 OK 再问一次");
+        } else if (st == 422) {
+            show_error("再说一次好吗");
+        } else if (st == 503) {
+            show_error("稍等一下下");
+        } else if (st == 502 || st == 500) {
+            show_error("没听清，再问一次");
+        } else {
+            show_error("出了点小问题");
+        }
         return;
     }
-
-    // 业务错误码映射（端点约定：422 再说一次 / 502·500 没听清 / 503 稍等）。
-    if (resp.status == 422) {
-        show_error("再说一次好吗");
-    } else if (resp.status == 503) {
-        show_error("稍等一下下");
-    } else if (resp.status == 502 || resp.status == 500) {
-        show_error("没听清，再问一次");
-    } else {
-        show_error(resp.answer_len ? resp.answer : "出了点小问题");
-    }
-    kid_resp_free(&resp);
+    free(ogg);
 }
 
 // ---------- 主流程 ----------
@@ -400,10 +449,15 @@ static void app_task(void *arg) {
         bool rec = false;
         flush_keys();
         while (wait_key(&k, -1)) {
-            if (k.btn == BSP_BTN_OK && k.event == BSP_BTN_PRESS) { rec = true; break; }
             if (k.btn == BSP_BTN_OK && k.event == BSP_BTN_LONG) { settings_menu(false); break; }
+            // v0.1.10：以「完整短按」CLICK 开录，不用 PRESS —— 否则长按进设置会
+            // 先被 PRESS 抢走变成一次录音。PRESS/RELEASE 在待机页一律忽略。
+            if (k.btn == BSP_BTN_OK &&
+                (k.event == BSP_BTN_CLICK || k.event == BSP_BTN_DOUBLE)) { rec = true; break; }
+            if (k.btn == BSP_BTN_OK &&
+                (k.event == BSP_BTN_PRESS || k.event == BSP_BTN_RELEASE)) continue;
             // 待机页其余按键给一次可见反馈，避免被误认为死机。
-            app_ui_toast("按住 OK 键说话");
+            app_ui_toast("按一下 OK 开始说话");
         }
         if (!rec) continue;   // 设置完成 → 重新显示待机页
         run_ask();
