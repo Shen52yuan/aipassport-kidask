@@ -11,14 +11,23 @@
 #include "bsp_audio.h"
 #include "bsp_i2c.h"
 #include "driver/i2c_master.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "kid_opus.h"
 #include "ogg_mux.h"
 #include "ogg_demux.h"
 
 static const char *TAG = "kid_audio";
+
+// v0.1.11：播放解码 PCM 缓冲改静态（8192 个 int16 = 16KB）。
+// 原来每次播放 malloc(16KB)，在「上行 Ogg + 下行 Ogg(可达 56KB) + TLS」同时驻留时
+// 是最大的连续块需求，碎片化后偶发失败且旧代码不检查 → 无声。
+// 静态区不参与运行期堆碎片；录音与播放串行，单缓冲足够。
+#define PLAY_PCM_CAP 8192
+static int16_t s_play_pcm[PLAY_PCM_CAP];
 
 // 16k/mono/20ms 一帧 = 320 样本 = 640 字节 PCM16。
 #define FRAME_SAMPLES  320
@@ -233,9 +242,10 @@ static void play_on_head(void *user, uint32_t rate, int channels, int preskip) {
     c->vol_sets++;
     ESP_LOGI(TAG, "播放前重设输出音量 %d%% (set_format=%s)", KID_VOLUME, esp_err_to_name(e));
 
-    // 每 20ms 帧：最大 48k*0.12s ≈ 5760 样本；留 8k 余量。
-    c->pcm_cap = 8192;
-    c->pcm = malloc((size_t)c->pcm_cap * c->ch * 2);
+    // v0.1.11：改用静态 PCM 缓冲，不再 malloc。解码器写入 n*ch 个 int16，
+    // 故每通道容量按声道数折半，保证总量恒为 PLAY_PCM_CAP 个样本。
+    c->pcm_cap = PLAY_PCM_CAP / (c->ch ? c->ch : 1);
+    c->pcm = s_play_pcm;
 }
 
 static void play_on_packet(void *user, const uint8_t *data, int plen) {
@@ -281,6 +291,16 @@ static void play_on_packet(void *user, const uint8_t *data, int plen) {
 
 esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len) {
     if (!ogg || len == 0) return ESP_ERR_INVALID_ARG;
+    if (len >= 4 && memcmp(ogg, "OggS", 4) != 0) {
+        ESP_LOGE(TAG, "下行数据不是 Ogg（前4字节 %02X %02X %02X %02X），拒绝解码",
+                 ogg[0], ogg[1], ogg[2], ogg[3]);
+        return ESP_ERR_INVALID_ARG;   // 交给上层重发，别让解封装器吃垃圾数据
+    }
+
+    ESP_LOGI(TAG, "播放开始: ogg=%uB heap=%u largest=%u",
+             (unsigned)len,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     // ⚠ 必须在播放前设置输出音量：BSP 的 s_volume 静态变量默认 0（静音），
     // 且 esp_codec_dev_open() 每次都会把它写进 ES8311 的 DAC 音量寄存器。
@@ -291,23 +311,32 @@ esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len) {
     play_ctx_t c = {0};
     ogg_demux_ret_t r = ogg_demux_parse(ogg, (int)len, &c, play_on_head, play_on_packet);
     if (r != OGG_DEMUX_OK) {
-        ESP_LOGE(TAG, "Ogg 解封装失败");
+        ESP_LOGE(TAG, "Ogg 解封装失败 ret=%d heap=%u largest=%u", (int)r,
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         if (c.dec) kid_decoder_destroy(c.dec);
-        free(c.pcm);
         return ESP_FAIL;
     }
     if (!c.dec) {
-        ESP_LOGE(TAG, "未解析到 OpusHead，无法播放");
-        free(c.pcm);
-        return ESP_FAIL;
+        // 走到这里说明 OpusHead 没解析到或解码器创建失败（后者多为堆不足）。
+        ESP_LOGE(TAG, "OpusHead/解码器缺失 heap=%u largest=%u",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        return ESP_ERR_NO_MEM;
     }
+    // c.pcm 是静态缓冲，绝不 free；decoder 常驻，destroy 只清引用。
     kid_decoder_destroy(c.dec);
-    free(c.pcm);
     ESP_LOGI(TAG, "播放完成 (rate=%u ch=%u vol=%d volset=%u pkts=%u samples=%u bytes=%u peak=%d werr=%u)",
              c.rate, c.ch, KID_VOLUME, (unsigned)c.vol_sets, (unsigned)c.packets,
              (unsigned)c.decoded_samples, (unsigned)c.written_bytes,
              (int)c.peak, (unsigned)c.write_errors);
     kid_audio_dump_regs("play_done");
+    // v0.1.11：一个包都没解出、或 I2S 写入出错，绝不能再返回 ESP_OK 假装播过了。
+    if (c.packets == 0 || c.write_errors > 0) {
+        ESP_LOGE(TAG, "播放未成功写出: pkts=%u werr=%u peak=%d",
+                 (unsigned)c.packets, (unsigned)c.write_errors, (int)c.peak);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
