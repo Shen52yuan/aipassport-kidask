@@ -340,7 +340,9 @@ static void run_ask(void) {
     }
     if (re == ESP_ERR_INVALID_STATE) {
         free(ogg);
-        app_ui_toast("没听清，再试一次");
+        // 唯一真正指向「孩子说的话没被录到」的分支（录音过短/电平过低），
+        // 文案要说清是没听清，别和下行「回答没收到」混在一起。
+        app_ui_toast("没听清，靠近点再说");
         flush_keys();
         return;
     }
@@ -351,11 +353,13 @@ static void run_ask(void) {
     }
     LOG_MEM("rec_done");
 
-    // v0.1.10：服务端日志证实每次都 200 且完整下发了音频（12KB~56KB），但设备
-    // 偶发「有文案、没声音」。旧代码有两个静默失败点：kid_net_post_ogg() 在
-    // transport err 时把已收到的 body 全部 free；kid_audio_play_ogg() 的返回值
-    // 无人检查。现在以「音频完整 + 解码播放成功」为成功条件，缺失自动重发一次，
-    // 并把每次实收/期望/传输状态打进串口，杜绝哑掉。
+    // v0.1.12：以「收到可播的 Ogg 数据」为成功条件，**不再要求字节数等于
+    // Content-Length**。Ogg 按页组织、每页独立 CRC，尾部被截断只损失最后一两秒，
+    // ogg_demux_parse() 会跳过残页，前面完整页完全可以正常播。
+    // 旧版（v0.1.10/11）硬判 complete，把大半已经到手的回答整段丢弃并重发：
+    // 服务端日志因此每轮出现两条语音参数完全相同的请求，孩子多等 6 秒仍只看到
+    // 「声音没收到」。叠加「按 Content-Length 现场 realloc ~40KB 连续堆块」在
+    // C3 无 PSRAM 上失败，就成了这次的稳定故障。现在下行缓冲在开机时常驻复用。
     for (int attempt = 0; attempt < 2; attempt++) {
         app_ui_set_state(KID_UI_THINK, NULL);
         kid_resp_t resp = {0};
@@ -364,27 +368,25 @@ static void run_ask(void) {
         LOG_MEM("http_done");
         flush_keys();
 
-        const bool complete  = (resp.content_len == 0) ||
-                               (resp.audio_len >= resp.content_len);
-        // v0.1.11：body 必须是真 Ogg。传输异常时保留下来的可能是被污染的半截数据，
-        // 长度够但内容错，交给解封装器只会读出匪夷所思的 nseg 与 CRC 垃圾。
-        const bool ogg_magic = resp.audio && resp.audio_len >= 64 &&
+        // body 必须是真 Ogg 且至少够一个头页 + 若干音频页，避免把污染数据交给解码器。
+        const bool ogg_magic = resp.audio && resp.audio_len >= 1024 &&
                                memcmp(resp.audio, "OggS", 4) == 0;
-        const bool has_audio = resp.status == 200 && ogg_magic && complete;
-        ESP_LOGI(TAG, "第%d次应答: pe=%s status=%d 音频=%uB/%uB 完整=%d Ogg=%d 文案=%uB 补充=%d(%s)",
+        const bool truncated = resp.content_len && resp.audio_len < resp.content_len;
+        const bool usable    = resp.status == 200 && ogg_magic;
+        ESP_LOGI(TAG, "第%d次应答: pe=%s status=%d 音频=%uB/%uB 截断=%d Ogg=%d 文案=%uB 补充=%d(%s)",
                  attempt + 1, esp_err_to_name(pe), resp.status,
-                 (unsigned)resp.audio_len, (unsigned)resp.content_len, complete ? 1 : 0,
+                 (unsigned)resp.audio_len, (unsigned)resp.content_len, truncated ? 1 : 0,
                  ogg_magic ? 1 : 0,
                  (unsigned)resp.answer_len, resp.need_retry ? 1 : 0,
                  resp.retry_reason[0] ? resp.retry_reason : "-");
         if (resp.answer_len) ESP_LOGI(TAG, "屏幕文案: %s", resp.answer);
 
-        if (has_audio) {
-            // v0.1.11 关键：播放前立刻释放上行录音 Ogg（10s 录音约 20KB）。
-            // 旧代码把它留到播放之后，播放瞬间同时驻留「上行 Ogg + 下行 Ogg(≤56KB)
-            // + 解码缓冲 + 解码器」，是堆峰值与分配失败的直接来源。
+        if (usable) {
+            // v0.1.11：播放前立刻释放上行录音 Ogg（10s 录音约 20KB），降低堆峰值。
             free(ogg);
             ogg = NULL;
+            if (truncated) ESP_LOGW(TAG, "尾部截断 %uB，按已收完整页播放",
+                                    (unsigned)(resp.content_len - resp.audio_len));
 
             // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
             // need_retry 时服务端下发的 answer 本身就是引导语（如「我没听清楚…」）。
@@ -409,23 +411,25 @@ static void run_ask(void) {
                 return;
             }
             ESP_LOGE(TAG, "下行 Ogg 解码/播放失败: %s", esp_err_to_name(play));
-            show_error("声音没放出来，按 OK 再问一次");
+            show_error("回答播不出，按 OK 再问一次");
             return;
         }
 
         const int st = resp.status;
         kid_resp_free(&resp);
-        if (attempt == 0 && (st == 200 || st == 0)) {
-            // 传输被截断 / 连接提前关闭：同一段录音原样重发一次，服务端重新生成
-            // 答案音频。只在异常路径发生，不影响正常问答耗时。
-            ESP_LOGW(TAG, "下行音频缺失或不完整，0.5s 后自动重发一次");
+        // v0.1.12：只有「几乎没收到 body」才重发。收到大半但不能播的情况交给上面
+        // 的 usable 分支播已收部分，不再白白多跑一次 ASR+LLM+TTS。
+        if (attempt == 0 && (st == 200 || st == 0) && !ogg_magic) {
+            ESP_LOGW(TAG, "下行音频缺失，0.5s 后自动重发一次");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
         free(ogg);
+        // 文案消歧：这里说的是**服务器返回的回答音频**，不是孩子说的话。
+        // 旧文案「声音没收到」让家长误以为设备没录到提问（2026-11-08 实机反馈）。
         if (st == 0 || st == 200) {
-            show_error("声音没收到，按 OK 再问一次");
+            show_error("回答没收到，按 OK 再问一次");
         } else if (st == 422) {
             show_error("再说一次好吗");
         } else if (st == 503) {
@@ -486,6 +490,9 @@ static void app_task(void *arg) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "KidAsk 问答机 启动");
+    // v0.1.12：趁堆最空（Wi-Fi / TLS / LVGL 都还没起来）一次性锁定下行接收缓冲，
+    // 之后每轮问答原地复用，杜绝问答时刻申请 ~40KB 连续块失败导致「声音没收到」。
+    kid_net_init_rx();
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     if (wake_causes & ~(1u << ESP_SLEEP_WAKEUP_UNDEFINED)) {
         ESP_LOGI(TAG, "休眠唤醒原因位图: 0x%02x", (unsigned)wake_causes);
