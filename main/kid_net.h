@@ -37,10 +37,19 @@ typedef struct {
 void kid_net_init_session(void);
 
 /* v0.1.12：在 app_main() 最早期（堆最空、尚无 Wi-Fi/TLS/LVGL 压力）一次性申请
-   64KB 常驻下行缓冲，整个运行期复用。ESP32-C3 无 PSRAM，以前每轮问答按
-   Content-Length 现场 realloc 约 40KB 连续块，在「上行 Ogg + TLS + LVGL」同时
-   驻留时偶发失败 → body 收不全 → 设备报「声音没收到」并重发。 */
+   常驻缓冲，整个运行期复用。ESP32-C3 无 PSRAM，以前每轮问答按 Content-Length
+   现场 realloc 约 40KB 连续块，在「上行 Ogg + TLS + LVGL」同时驻留时偶发失败
+   → body 收不全 → 设备报「声音没收到」并重发。
+
+   v0.1.13：缓冲**同时**作为上行录音 Ogg 的输出区（录音与接收在时间上不重叠）。
+   上一版单独拿 64KB 只做下行，把启动后剩余堆从 84KB 压到 18KB，Opus 编码器
+   （十几 KB）创建失败 → 屏幕「录音出问题了」（2026-11-08 实机）。共用一块后
+   常驻占用降到 40KB，录音阶段只需再拿编码器与 6.4KB 工作区。 */
 void kid_net_init_rx(void);
+
+/* v0.1.13：取常驻共享缓冲供录音使用（返回 NULL 表示缓冲申请失败）。
+   用法：录音前取，录完把数据交给 kid_net_post_ogg()；不要在两次调用之间保存指针。 */
+uint8_t *kid_net_pool(size_t *cap);
 
 /* 上行：把整段 Ogg Opus（Content-Type: application/ogg）POST 到端点。
    成功返回 ESP_OK；resp.status==200 表示业务成功。失败时 resp.audio==NULL。 */
