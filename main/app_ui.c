@@ -87,11 +87,13 @@ static const char *kid_state_word(kid_ui_state_t st) {
 
 static const char *kid_state_guide(kid_ui_state_t st) {
     switch (st) {
-    case KID_UI_IDLE:    return "按住 OK 键说话";
-    case KID_UI_RECORD:  return "我在听…松手发送";
+    case KID_UI_IDLE:    return "按 OK 开始说话";
+    case KID_UI_RECORD:  return "说完再按 OK 发送";
     case KID_UI_THINK:   return "小问号正在想…";
     case KID_UI_ANSWER:  return "正在读给你听";
-    case KID_UI_ERROR:   return "说“再说一次”重试";
+    // v0.1.10：旧文案「说“再说一次”重试」承诺了一个并不存在的语音指令，
+    // 实测有孩子真的对着设备念「再说一次」，被 ASR 当成新问题。改为明确的按键提示。
+    case KID_UI_ERROR:   return "按 OK 再问一次";
     default:             return "";
     }
 }
