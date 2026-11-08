@@ -27,7 +27,10 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
 # 注意:LVGL 9.3+ 只认 LV_MEM_SIZE(字节);旧的 LV_MEM_SIZE_KILOBYTES 会被默认 64KB 覆盖,
 # 实测曾因此让 BluFi 的 BLE 控制器 ESP_ERR_NO_MEM。Qoder Passport 页面对象不多,32KB 足够。
-CONFIG_LV_MEM_SIZE=32768
+# v0.1.14：32KB → 24KB。KidAsk 页面只有待机/录音/思考/答案/错误/设置/配网页，
+# 对象数量少；把省下的 8KB 还给系统堆 —— HTTPS 阶段的堆余量是本机最大的瓶颈
+# （见文件末尾 v0.1.14 说明）。若后续新增复杂页面需回退到 32768。
+CONFIG_LV_MEM_SIZE=24576
 CONFIG_LV_TXT_ENC_UTF8=y
 CONFIG_LV_USE_FONT_PLACEHOLDER=y
 
@@ -64,13 +67,28 @@ CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
 # 还给堆。实时语音码率约 64KB/s,远低于不开优化时的吞吐上限。静态 RX 缓冲 10→8 再省 3KB。
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+# v0.1.14：静态 RX 8→6(每块 1600B，再省 3.2KB)。8KB TCP 窗口最多约 6 个满长报文
+# 在途，6 块静态缓冲正好匹配；突发丢包由 TCP 重传兜住，不影响正确性。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 # 收发包缓冲上限(实机日志驱动)：默认动态 RX/TX 各 32 个、tcpip 邮箱 32，插话瞬间旧回答下行全速
 # 冲刷 + 上行回补 200 ms 语音同时发生，Wi-Fi/lwIP 一度占掉约 25KB，最低剩余堆只剩 772 字节。
 # 改 RX 12 后(boot17)仍有 63 次约 1.5KB 收包分配失败：12 个满长帧≈20KB，几乎等于会话中
 # 的全部剩余堆，连 TCP ACK 都可能分配不到而触发重传卡顿。8KB TCP 窗口最多约 6 个满长报文
 # 在途，加乱序缓存 4 个，RX 10 个(Kconfig 要求≥静态 8)足够，并给 ACK 等留出余量；参考小智
 # C3 配置收紧 tcpip 邮箱到 16。超出上限的包由 TCP 重传，不会破坏数据或 TLS。
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=10
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# v0.1.14：动态 RX 10→8、TX 16→12（合计再省约 9.6KB）。问答是串行的：
+# 先上行 20~30KB，再下行 12~56KB，不存在双向满速并发；收紧后峰值内存明显下降，
+# 超出上限的包由 TCP 重传兜住。
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=12
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+
+# --- v0.1.14：HTTPS 阶段堆余量(实机日志驱动) ---
+# 2026-11-08 实机串口：v0.1.13 在 POST 前只剩 heap=45,436B，TLS 阶段最低记录到
+# 996B / 768B —— 即一次 TLS 会话要吃掉约 44KB，可用量正好卡在临界点。表现为
+# mbedtls_ssl_handshake 返回 -0x2700(证书校验失败) 或请求体发不出去(nginx 侧
+# 499/408)，同一固件"有时通、有时不通"。
+# 因此：显式关闭 TLS 1.3(TLS 1.3 的握手/密钥调度比 1.2 多占数 KB 连续内存，
+# 服务端 nginx 默认也支持 1.2)与会话票据缓存，把余量留给必需路径。
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=n
+CONFIG_MBEDTLS_SSL_SESSION_TICKETS=n
