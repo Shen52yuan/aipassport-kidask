@@ -259,6 +259,9 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
     esp_err_t err = esp_http_client_perform(h);
     out->status = esp_http_client_get_status_code(h);
     out->content_len = c.expected_len;
+    // v0.1.14：连接级失败（DNS/TCP/TLS 都没成）单独上报，上层据此给「网络没连上」
+    // 而不是笼统的「回答没收到」，并跳过重发（重发只会再干等一个超时）。
+    out->conn_failed = (err == ESP_ERR_HTTP_CONNECT);
     ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d 音频=%uB/Content-Length=%uB 溢出=%d "
                   "最大连续块=%uB min堆=%uB 文案=%uB asr=%uB retry=%d(%s)",
              esp_err_to_name(err), out->status, (unsigned)c.len,
