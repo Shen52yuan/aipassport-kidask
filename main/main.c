@@ -24,6 +24,7 @@
 #include "bsp_display.h"
 #include "bsp_i2c.h"
 #include "bsp_pins.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -45,9 +46,12 @@ static const char *TAG = "main";
 
 // libopus 的 opus_encode() 会在运行期用 alloca 连续切走约 20KB 栈， HTTPS 阶段
 // 又叠加 Ogg/TLS/响应缓冲，逐段记录内存水位以便实机定位瓶颈。
-#define LOG_MEM(where) ESP_LOGI(TAG, "[mem] %-10s heap=%u min=%u stack_left=%u", \
+// v0.1.11：补最大连续空闲块。总量够、连续块不足正是连续多轮后分配失败的真凶，
+// 只看 heap/min 无法区分这两者。
+#define LOG_MEM(where) ESP_LOGI(TAG, "[mem] %-10s heap=%u min=%u largest=%u stack_left=%u", \
     where, (unsigned)esp_get_free_heap_size(), \
     (unsigned)esp_get_minimum_free_heap_size(), \
+    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), \
     (unsigned)uxTaskGetStackHighWaterMark(NULL))
 
 typedef struct {
@@ -362,33 +366,49 @@ static void run_ask(void) {
 
         const bool complete  = (resp.content_len == 0) ||
                                (resp.audio_len >= resp.content_len);
-        const bool has_audio = resp.status == 200 && resp.audio &&
-                               resp.audio_len >= 64 && complete;
-        ESP_LOGI(TAG, "第%d次应答: pe=%s status=%d 音频=%uB/%uB 完整=%d 文案=%uB 补充=%d(%s)",
+        // v0.1.11：body 必须是真 Ogg。传输异常时保留下来的可能是被污染的半截数据，
+        // 长度够但内容错，交给解封装器只会读出匪夷所思的 nseg 与 CRC 垃圾。
+        const bool ogg_magic = resp.audio && resp.audio_len >= 64 &&
+                               memcmp(resp.audio, "OggS", 4) == 0;
+        const bool has_audio = resp.status == 200 && ogg_magic && complete;
+        ESP_LOGI(TAG, "第%d次应答: pe=%s status=%d 音频=%uB/%uB 完整=%d Ogg=%d 文案=%uB 补充=%d(%s)",
                  attempt + 1, esp_err_to_name(pe), resp.status,
                  (unsigned)resp.audio_len, (unsigned)resp.content_len, complete ? 1 : 0,
+                 ogg_magic ? 1 : 0,
                  (unsigned)resp.answer_len, resp.need_retry ? 1 : 0,
                  resp.retry_reason[0] ? resp.retry_reason : "-");
         if (resp.answer_len) ESP_LOGI(TAG, "屏幕文案: %s", resp.answer);
 
         if (has_audio) {
+            // v0.1.11 关键：播放前立刻释放上行录音 Ogg（10s 录音约 20KB）。
+            // 旧代码把它留到播放之后，播放瞬间同时驻留「上行 Ogg + 下行 Ogg(≤56KB)
+            // + 解码缓冲 + 解码器」，是堆峰值与分配失败的直接来源。
+            free(ogg);
+            ogg = NULL;
+
             // 屏幕要点：优先答案，退而显示识别到的问题，最后兜底占位，保证卡片不空白。
             // need_retry 时服务端下发的 answer 本身就是引导语（如「我没听清楚…」）。
             const char *card = resp.answer_len ? resp.answer
                              : (resp.asr_len ? resp.asr : "正在读给你听~");
             app_ui_set_state(KID_UI_ANSWER, card);
             esp_err_t play = kid_audio_play_ogg(resp.audio, resp.audio_len);
+            if (play == ESP_ERR_NO_MEM || play == ESP_ERR_INVALID_STATE ||
+                play == ESP_ERR_INVALID_ARG) {
+                // 这几类失败都发生在任何 PCM 写出之前，本地重试一次不会造成重播。
+                ESP_LOGW(TAG, "首次播放未启动(%s)，300ms 后本地重试一次", esp_err_to_name(play));
+                vTaskDelay(pdMS_TO_TICKS(300));
+                play = kid_audio_play_ogg(resp.audio, resp.audio_len);
+            }
             LOG_MEM("play_done");
             const bool need_retry = resp.need_retry;
             kid_resp_free(&resp);
-            free(ogg);
             if (play == ESP_OK) {
                 // need_retry：播完童声引导回待机等补充，session 不变，下一轮 POST
                 // 带着这一轮引导语作为上下文来理解孩子的补充说明。
                 vTaskDelay(pdMS_TO_TICKS(need_retry ? 2000 : 3000));
                 return;
             }
-            ESP_LOGE(TAG, "下行 Ogg 解码/播放失败，不再静默放过");
+            ESP_LOGE(TAG, "下行 Ogg 解码/播放失败: %s", esp_err_to_name(play));
             show_error("声音没放出来，按 OK 再问一次");
             return;
         }
