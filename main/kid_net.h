@@ -6,7 +6,10 @@
 /* 固定端点（任务卡 §7 真值，末尾必须带 /）。设备侧仅此一个字符串常量（协议「不鉴权」折中：
    随机不可猜路径 + nginx 限流）。 */
 #define KID_ENDPOINT "https://tonynotatom.xyz/kid/ask-bb99ef8c69b6d89f8c6f474ebe97fc55/"
-#define KID_HTTP_TIMEOUT_MS 30000
+/* v0.1.14：30s → 20s。服务端正常一轮 ASR+LLM+TTS 是 6~8s，20s 已是 2.5 倍余量；
+   实机出现「思考了很久」正是 30s 超时 ×2 次尝试 = 60~70s 的干等。
+   缩短后即使失败，孩子最多等 40s 就能看到提示并重试。 */
+#define KID_HTTP_TIMEOUT_MS 20000
 
 #define KID_ANSWER_CAP 512   /* X-Answer-Text URL 解码后字节上限（任务卡 ≤120 字 ≈360B） */
 #define KID_ASR_CAP    512   /* X-Asr-Text 上限 */
