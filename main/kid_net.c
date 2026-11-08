@@ -6,10 +6,39 @@
 #include <strings.h>
 #include <stdlib.h>
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 
 static const char *TAG = "kid_net";
+
+/* v0.1.12：常驻下行接收缓冲。
+   服务端实测量大值约 56KB（正常回答 17~40KB），留 64KB 余量。放在启动期一次性
+   申请而不是静态 .bss：既不挤压 C3 本就紧张的 DRAM 段（链接期超标风险），
+   又彻底消除运行期按 Content-Length 现场申请 40KB 连续块导致的碎片失败。
+   全设备只有一个 app 任务串行收发，无需加锁。 */
+#define KID_RX_CAP        (64 * 1024)
+#define KID_RX_CAP_MIN    (32 * 1024)
+static uint8_t *s_rx_buf;
+static size_t   s_rx_cap;
+
+void kid_net_init_rx(void) {
+    if (s_rx_buf) return;
+    s_rx_cap = KID_RX_CAP;
+    s_rx_buf = (uint8_t *)heap_caps_malloc(s_rx_cap, MALLOC_CAP_8BIT);
+    if (!s_rx_buf) {
+        s_rx_cap = KID_RX_CAP_MIN;
+        s_rx_buf = (uint8_t *)heap_caps_malloc(s_rx_cap, MALLOC_CAP_8BIT);
+    }
+    if (!s_rx_buf) {
+        ESP_LOGE(TAG, "下行常驻缓冲分配失败，将退回运行期动态分配（有碎片风险）");
+        s_rx_cap = 0;
+    } else {
+        ESP_LOGI(TAG, "下行常驻缓冲就绪: %uB @ %p, 最大连续空闲块=%uB",
+                 (unsigned)s_rx_cap, s_rx_buf,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+}
 
 /* v0.1.9：一次开机 = 一个会话。16 位十六进制随机串，服务端按此维护最近 3 轮
    问答文本（纯内存、5 分钟超时、不存音频）。重启即换新 id，等于开新话题。 */
@@ -88,7 +117,9 @@ typedef struct {
     uint8_t    *buf;
     size_t      len;
     size_t      cap;
-    size_t      expected_len;   // Content-Length：一次分配到位，避免 realloc 翻倍峰值
+    size_t      expected_len;   // Content-Length，仅用于日志与截断提示
+    bool        dynamic;        // buf 是运行期 malloc 的（常驻缓冲申请失败时的回退）
+    bool        overflow;       // 常驻缓冲装不下，尾部被丢弃
 } net_ctx_t;
 
 static esp_err_t on_event(esp_http_client_event_t *ev) {
@@ -121,17 +152,42 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
         break;
     case HTTP_EVENT_ON_DATA:
         if (ev->data_len > 0) {
-            size_t need = c->len + (size_t)ev->data_len;
-            if (need > c->cap) {
-                size_t ncap = c->cap ? c->cap * 2
-                                     : (c->expected_len ? c->expected_len : 8192);
-                while (ncap < need) ncap *= 2;
-                uint8_t *nb = (uint8_t *)realloc(c->buf, ncap);
-                if (!nb) { ESP_LOGE(TAG, "音频缓冲分配失败"); return ESP_ERR_NO_MEM; }
-                c->buf = nb; c->cap = ncap;
+            size_t take = (size_t)ev->data_len;
+
+            // 常驻缓冲未就绪时的回退：沿用运行期按需增长（有碎片风险，仅兜底）。
+            if (!c->buf) {
+                size_t ncap = c->expected_len ? c->expected_len : 8192;
+                while (ncap < take) ncap *= 2;
+                uint8_t *nb = (uint8_t *)malloc(ncap);
+                if (!nb) {
+                    ESP_LOGE(TAG, "下行缓冲分配失败(需要 %uB, 最大连续块 %uB)",
+                             (unsigned)ncap,
+                             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                    return ESP_ERR_NO_MEM;
+                }
+                c->buf = nb; c->cap = ncap; c->dynamic = true;
             }
-            memcpy(c->buf + c->len, ev->data, ev->data_len);
-            c->len += ev->data_len;
+
+            if (c->len + take > c->cap) {
+                if (c->dynamic) {
+                    size_t ncap = c->cap * 2;
+                    while (ncap < c->len + take) ncap *= 2;
+                    uint8_t *nb = (uint8_t *)realloc(c->buf, ncap);
+                    if (!nb) {
+                        ESP_LOGE(TAG, "下行缓冲扩容失败(需要 %uB)", (unsigned)ncap);
+                        return ESP_ERR_NO_MEM;
+                    }
+                    c->buf = nb; c->cap = ncap;
+                } else {
+                    // 常驻缓冲封顶：保留已收到的完整页，绝不越界。
+                    c->overflow = true;
+                    take = c->cap - c->len;
+                }
+            }
+            if (take) {
+                memcpy(c->buf + c->len, ev->data, take);
+                c->len += take;
+            }
         }
         break;
     default:
@@ -142,7 +198,8 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
 
 esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) {
     memset(out, 0, sizeof(*out));
-    net_ctx_t c = { .resp = out, .buf = NULL, .len = 0, .cap = 0 };
+    // v0.1.12：直接复用启动期常驻缓冲，本轮 POST 不再有任何大块堆分配。
+    net_ctx_t c = { .resp = out, .buf = s_rx_buf, .len = 0, .cap = s_rx_cap };
 
     esp_http_client_config_t cfg = {
         .url = KID_ENDPOINT,
@@ -171,30 +228,41 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
     esp_err_t err = esp_http_client_perform(h);
     out->status = esp_http_client_get_status_code(h);
     out->content_len = c.expected_len;
-    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB/%uB answer=%uB asr=%uB retry=%d(%s)",
+    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d 音频=%uB/Content-Length=%uB 溢出=%d "
+                  "最大连续块=%uB 文案=%uB asr=%uB retry=%d(%s)",
              esp_err_to_name(err), out->status, (unsigned)c.len,
-             (unsigned)c.expected_len,
+             (unsigned)c.expected_len, c.overflow ? 1 : 0,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
              (unsigned)out->answer_len, (unsigned)out->asr_len,
              out->need_retry ? 1 : 0,
              out->retry_reason[0] ? out->retry_reason : "-");
     /* v0.1.10：无论 perform 返回什么，只要收到了 body 就交给上层。
        旧版在 err != ESP_OK 时 free(c.buf)，把「头已到（含答案文案）、音频已收
-       大半」的响应整段丢掉，上层只能显示文案 + 两声嘀，孩子以为机器坏了。
-       完整性由 main.c 用 content_len 与 audio_len 校验，缺了就自动重发。 */
+       大半」的响应整段丢掉，上层只能显示文案 + 两声嘀。
+       v0.1.12：不再因「少于 Content-Length」就判失败 —— Ogg 每页独立带 CRC，
+       解封装器会跳过被截断的尾页，前面完整页完全可以正常播。 */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "传输异常 %s，保留已收 %uB（期望 %uB）",
                  esp_err_to_name(err), (unsigned)c.len, (unsigned)c.expected_len);
     }
     if (c.expected_len && c.len < c.expected_len) {
-        ESP_LOGW(TAG, "音频接收不完整: 实收 %uB < Content-Length %uB",
+        ESP_LOGW(TAG, "响应被截断: 实收 %uB < Content-Length %uB，按已收完整页播放",
                  (unsigned)c.len, (unsigned)c.expected_len);
     }
-    out->audio = c.buf;
-    out->audio_len = c.len;
+    if (c.overflow) {
+        ESP_LOGW(TAG, "下行超过常驻缓冲 %uB，尾部已丢弃（仍可播前面完整页）",
+                 (unsigned)c.cap);
+    }
+    out->audio        = c.buf;
+    out->audio_len    = c.len;
+    out->audio_static = !c.dynamic;   // 常驻缓冲不可 free
     esp_http_client_cleanup(h);
     return err;
 }
 
 void kid_resp_free(kid_resp_t *r) {
-    if (r && r->audio) { free(r->audio); r->audio = NULL; r->audio_len = 0; }
+    if (!r || !r->audio) return;
+    if (!r->audio_static) free(r->audio);   // 仅释放运行期回退分配的缓冲
+    r->audio = NULL;
+    r->audio_len = 0;
 }
