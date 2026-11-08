@@ -170,19 +170,27 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
 
     esp_err_t err = esp_http_client_perform(h);
     out->status = esp_http_client_get_status_code(h);
-    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB answer=%uB asr=%uB retry=%d(%s)",
+    out->content_len = c.expected_len;
+    ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d audio=%uB/%uB answer=%uB asr=%uB retry=%d(%s)",
              esp_err_to_name(err), out->status, (unsigned)c.len,
+             (unsigned)c.expected_len,
              (unsigned)out->answer_len, (unsigned)out->asr_len,
              out->need_retry ? 1 : 0,
              out->retry_reason[0] ? out->retry_reason : "-");
-    if (err == ESP_OK) {
-        out->audio = c.buf;
-        out->audio_len = c.len;
-    } else {
-        free(c.buf);
-        out->audio = NULL;
-        out->audio_len = 0;
+    /* v0.1.10：无论 perform 返回什么，只要收到了 body 就交给上层。
+       旧版在 err != ESP_OK 时 free(c.buf)，把「头已到（含答案文案）、音频已收
+       大半」的响应整段丢掉，上层只能显示文案 + 两声嘀，孩子以为机器坏了。
+       完整性由 main.c 用 content_len 与 audio_len 校验，缺了就自动重发。 */
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "传输异常 %s，保留已收 %uB（期望 %uB）",
+                 esp_err_to_name(err), (unsigned)c.len, (unsigned)c.expected_len);
     }
+    if (c.expected_len && c.len < c.expected_len) {
+        ESP_LOGW(TAG, "音频接收不完整: 实收 %uB < Content-Length %uB",
+                 (unsigned)c.len, (unsigned)c.expected_len);
+    }
+    out->audio = c.buf;
+    out->audio_len = c.len;
     esp_http_client_cleanup(h);
     return err;
 }
