@@ -22,7 +22,13 @@ static const char *TAG = "kid_net";
      响应体再写回池。
    HTTP/1.1 下请求体必然先写完才会收到响应头，所以接收覆盖池是安全的；
    ON_DATA 里额外校验 hdr_seen 作为结构性保护。
-   全设备只有一个 app 任务串行收发，无需加锁。 */
+   全设备只有一个 app 任务串行收发，无需加锁。
+
+   v0.1.14：池尺寸维持 40KB 不变 —— 实测下行回答 12~56KB，缩小会截掉长回答尾巴。
+   真正致命的是「池常驻后 HTTPS 阶段只剩 45KB 堆」，一次 TLS 会话要吃掉约 44KB
+   （实机 min 堆 996B/768B），正好卡在悬崖边：同一固件有时 -0x2700 握手失败、
+   有时请求体发不出去（服务端侧 nginx 记 499/408）。余量改从 LVGL 池、Wi-Fi
+   收发缓冲与 TLS 1.3 开关里省（见 sdkconfig.defaults），池本身不动。 */
 #define KID_RX_CAP        (40 * 1024)
 #define KID_RX_CAP_MIN    (28 * 1024)
 static uint8_t *s_rx_buf;
@@ -254,10 +260,11 @@ esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) 
     out->status = esp_http_client_get_status_code(h);
     out->content_len = c.expected_len;
     ESP_LOGI(TAG, "HTTP 完成: err=%s status=%d 音频=%uB/Content-Length=%uB 溢出=%d "
-                  "最大连续块=%uB 文案=%uB asr=%uB retry=%d(%s)",
+                  "最大连续块=%uB min堆=%uB 文案=%uB asr=%uB retry=%d(%s)",
              esp_err_to_name(err), out->status, (unsigned)c.len,
              (unsigned)c.expected_len, c.overflow ? 1 : 0,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)esp_get_minimum_free_heap_size(),
              (unsigned)out->answer_len, (unsigned)out->asr_len,
              out->need_retry ? 1 : 0,
              out->retry_reason[0] ? out->retry_reason : "-");
