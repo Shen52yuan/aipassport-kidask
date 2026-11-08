@@ -318,6 +318,11 @@ static void show_error(const char *msg) {
     wait_ok_any();
 }
 
+// v0.1.13：录音可能直接写进 kid_net 的常驻共享池，那块内存不归我们释放。
+static void free_ogg(uint8_t *p) {
+    if (p && p != kid_net_pool(NULL)) free(p);
+}
+
 static void run_ask(void) {
     ESP_LOGI(TAG, "开始问答: 按 OK 开录 → 再按 OK 发送 → 上传 → 播放");
     LOG_MEM("ask_start");
@@ -330,16 +335,28 @@ static void run_ask(void) {
 
     uint8_t *ogg = NULL;
     size_t   ogg_len = 0;
-    esp_err_t re = kid_audio_record_ogg(&ogg, &ogg_len, ask_should_stop, ask_on_level);
+    size_t   pool_cap = 0;
+    uint8_t *pool = kid_net_pool(&pool_cap);
+    esp_err_t re;
+    // v0.1.13：优先把 Ogg 直接封装进常驻共享池 —— 旧的可增长缓冲要 2 倍扩容，
+    // 10s 录音约需 60KB 连续堆；v0.1.12 把 64KB 拿去常驻后堆只剩 18KB，
+    // Opus 编码器创建失败，屏幕报「录音出问题了」。共享池写满即收尾，不失败。
+    if (pool && pool_cap >= 8192) {
+        re = kid_audio_record_ogg_to(pool, pool_cap, &ogg_len,
+                                     ask_should_stop, ask_on_level);
+        ogg = pool;                       // 即使 re != ESP_OK 也指向池，便于统一日志
+    } else {
+        re = kid_audio_record_ogg(&ogg, &ogg_len, ask_should_stop, ask_on_level);
+    }
     if (s_record_cancel) {
-        free(ogg);
+        free_ogg(ogg);
         ESP_LOGI(TAG, "本次录音已取消");
         app_ui_toast("已取消，按 OK 重新说");
         flush_keys();
         return;
     }
     if (re == ESP_ERR_INVALID_STATE) {
-        free(ogg);
+        free_ogg(ogg);
         // 唯一真正指向「孩子说的话没被录到」的分支（录音过短/电平过低），
         // 文案要说清是没听清，别和下行「回答没收到」混在一起。
         app_ui_toast("没听清，靠近点再说");
@@ -347,7 +364,10 @@ static void run_ask(void) {
         return;
     }
     if (re != ESP_OK) {
-        free(ogg);
+        ESP_LOGE(TAG, "录音失败: %s（剩余堆=%u 最大连续块=%u）",
+                 esp_err_to_name(re), (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        free_ogg(ogg);
         show_error("录音出问题了");
         return;
     }
@@ -383,7 +403,8 @@ static void run_ask(void) {
 
         if (usable) {
             // v0.1.11：播放前立刻释放上行录音 Ogg（10s 录音约 20KB），降低堆峰值。
-            free(ogg);
+            // v0.1.13：录音走共享池时这里只是空操作（池同时装着下行音频）。
+            free_ogg(ogg);
             ogg = NULL;
             if (truncated) ESP_LOGW(TAG, "尾部截断 %uB，按已收完整页播放",
                                     (unsigned)(resp.content_len - resp.audio_len));
@@ -416,16 +437,20 @@ static void run_ask(void) {
         }
 
         const int st = resp.status;
+        const size_t rx_len = resp.audio_len;
         kid_resp_free(&resp);
         // v0.1.12：只有「几乎没收到 body」才重发。收到大半但不能播的情况交给上面
         // 的 usable 分支播已收部分，不再白白多跑一次 ASR+LLM+TTS。
-        if (attempt == 0 && (st == 200 || st == 0) && !ogg_magic) {
+        // v0.1.13：录音写在共享池里，一旦响应体动过池子，重发就会把被覆盖的垃圾
+        // 当录音再 POST 一次（服务端只会再答一遍错问题）。只有「一个字节都没收到」
+        // 才允许重发 —— 那时池里仍是完整的上行 Ogg。
+        if (attempt == 0 && (st == 200 || st == 0) && !ogg_magic && rx_len == 0) {
             ESP_LOGW(TAG, "下行音频缺失，0.5s 后自动重发一次");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        free(ogg);
+        free_ogg(ogg);
         // 文案消歧：这里说的是**服务器返回的回答音频**，不是孩子说的话。
         // 旧文案「声音没收到」让家长误以为设备没录到提问（2026-11-08 实机反馈）。
         if (st == 0 || st == 200) {
@@ -441,7 +466,7 @@ static void run_ask(void) {
         }
         return;
     }
-    free(ogg);
+    free_ogg(ogg);
 }
 
 // ---------- 主流程 ----------
