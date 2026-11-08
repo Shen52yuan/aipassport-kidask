@@ -17,11 +17,14 @@ typedef struct {
     size_t   answer_len;
     char     asr[KID_ASR_CAP];        /* URL 解码后的识别文本（UTF-8，\0 结尾） */
     size_t   asr_len;
-    uint8_t *audio;         /* Ogg Opus 音频主体（堆分配，需 kid_resp_free 释放） */
+    /* v0.1.12：audio 指向启动期一次性分配的常驻下行缓冲，运行期不再 malloc。
+       audio_static=true 时 kid_resp_free() 不得 free（下一轮 POST 会原地复用）。 */
+    uint8_t *audio;
     size_t   audio_len;
-    /* v0.1.10：响应 Content-Length（0 表示未知/chunked）。上层据此判断音频是否
-       收全；旧版在 esp_http_client_perform 返回非 OK 时直接丢掉已收 body，
-       造成「服务端 200 且答案文案到位、设备却无音频可播」的静默失败。 */
+    bool     audio_static;
+    /* v0.1.10：响应 Content-Length（0 表示未知/chunked）。v0.1.12 起仅用于日志与
+       「是否截断」提示，不再作为「能不能播」的硬门槛：Ogg 按页独立，尾部截断时
+       前面完整页照样能播，硬判完整反而让每次正常回答都被丢弃并重发。 */
     size_t   content_len;
     /* v0.1.9 / 服务端 v0.2.0：X-Need-Retry: 1 表示「没听清 / 问题不完整」，
        此时 audio 是童声引导提示音而非答案，播完回待机等待孩子按 OK 补充。 */
@@ -32,6 +35,12 @@ typedef struct {
 /* v0.1.9：开机调用一次，生成本次开机的会话 id。之后每轮 POST 都带 X-Session-Id，
    服务端据此维护最近 3 轮上下文；重启换 id = 开新话题。不带该头则退化为无状态单轮。 */
 void kid_net_init_session(void);
+
+/* v0.1.12：在 app_main() 最早期（堆最空、尚无 Wi-Fi/TLS/LVGL 压力）一次性申请
+   64KB 常驻下行缓冲，整个运行期复用。ESP32-C3 无 PSRAM，以前每轮问答按
+   Content-Length 现场 realloc 约 40KB 连续块，在「上行 Ogg + TLS + LVGL」同时
+   驻留时偶发失败 → body 收不全 → 设备报「声音没收到」并重发。 */
+void kid_net_init_rx(void);
 
 /* 上行：把整段 Ogg Opus（Content-Type: application/ogg）POST 到端点。
    成功返回 ESP_OK；resp.status==200 表示业务成功。失败时 resp.audio==NULL。 */
