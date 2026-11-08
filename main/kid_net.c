@@ -9,16 +9,22 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 
 static const char *TAG = "kid_net";
 
 /* v0.1.12：常驻下行接收缓冲。
-   服务端实测量大值约 56KB（正常回答 17~40KB），留 64KB 余量。放在启动期一次性
-   申请而不是静态 .bss：既不挤压 C3 本就紧张的 DRAM 段（链接期超标风险），
-   又彻底消除运行期按 Content-Length 现场申请 40KB 连续块导致的碎片失败。
+   v0.1.13：从 64KB 降到 40KB，并**同时**用作上行录音 Ogg 的输出区 —— 上一版
+   单独占 64KB 只服务下行，把启动后剩余堆从 84KB 压到 18KB（实测日志
+   `剩余堆 18440`），Opus 编码器创建失败，屏幕直接报「录音出问题了」。
+   录音（上行）与接收（下行）在时间上严格不重叠：
+     录音写池 → POST 把池当请求体发出 → 服务端响应头到达（ON_HEADER）→
+     响应体再写回池。
+   HTTP/1.1 下请求体必然先写完才会收到响应头，所以接收覆盖池是安全的；
+   ON_DATA 里额外校验 hdr_seen 作为结构性保护。
    全设备只有一个 app 任务串行收发，无需加锁。 */
-#define KID_RX_CAP        (64 * 1024)
-#define KID_RX_CAP_MIN    (32 * 1024)
+#define KID_RX_CAP        (40 * 1024)
+#define KID_RX_CAP_MIN    (28 * 1024)
 static uint8_t *s_rx_buf;
 static size_t   s_rx_cap;
 
@@ -31,13 +37,19 @@ void kid_net_init_rx(void) {
         s_rx_buf = (uint8_t *)heap_caps_malloc(s_rx_cap, MALLOC_CAP_8BIT);
     }
     if (!s_rx_buf) {
-        ESP_LOGE(TAG, "下行常驻缓冲分配失败，将退回运行期动态分配（有碎片风险）");
+        ESP_LOGE(TAG, "共享缓冲分配失败，将退回运行期动态分配（有碎片风险）");
         s_rx_cap = 0;
     } else {
-        ESP_LOGI(TAG, "下行常驻缓冲就绪: %uB @ %p, 最大连续空闲块=%uB",
+        ESP_LOGI(TAG, "上行/下行共享缓冲就绪: %uB @ %p, 分配后剩余堆=%uB 最大连续块=%uB",
                  (unsigned)s_rx_cap, s_rx_buf,
+                 (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
+}
+
+uint8_t *kid_net_pool(size_t *cap) {
+    if (cap) *cap = s_rx_cap;
+    return s_rx_buf;
 }
 
 /* v0.1.9：一次开机 = 一个会话。16 位十六进制随机串，服务端按此维护最近 3 轮
@@ -120,12 +132,17 @@ typedef struct {
     size_t      expected_len;   // Content-Length，仅用于日志与截断提示
     bool        dynamic;        // buf 是运行期 malloc 的（常驻缓冲申请失败时的回退）
     bool        overflow;       // 常驻缓冲装不下，尾部被丢弃
+    bool        hdr_seen;       // 已收到响应头 = 请求体肯定已发完，池可以安全覆盖
+    bool        tx_in_pool;     // 本次请求体就是共享池（录音直接写池）
 } net_ctx_t;
 
 static esp_err_t on_event(esp_http_client_event_t *ev) {
     net_ctx_t *c = (net_ctx_t *)ev->user_data;
     switch (ev->event_id) {
     case HTTP_EVENT_ON_HEADER:
+        // 收到响应头 ⇒ 请求体（可能就放在共享池里）已经全部发完，
+        // 之后 ON_DATA 覆盖池不会破坏正在发送的数据。
+        c->hdr_seen = true;
         // ⚠ esp_http_client 的 ON_HEADER 事件里 ev->data_len 恒为 0：头值是
         // NUL 结尾字符串，长度并不通过 data_len 传递。v0.1.6 误用 data_len
         // 作 url_decode 的长度，解出 0 字节，屏幕要点卡片因此一直空白。
@@ -152,6 +169,12 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
         break;
     case HTTP_EVENT_ON_DATA:
         if (ev->data_len > 0) {
+            if (c->tx_in_pool && !c->hdr_seen) {
+                // 结构性保护：请求体还放在共享池里、响应头还没到就写池，
+                // 会破坏正在发送的录音。正常 HTTP/1.1 顺序下不会发生。
+                ESP_LOGE(TAG, "异常时序：响应体早于响应头，拒绝覆盖上行数据");
+                return ESP_FAIL;
+            }
             size_t take = (size_t)ev->data_len;
 
             // 常驻缓冲未就绪时的回退：沿用运行期按需增长（有碎片风险，仅兜底）。
@@ -199,7 +222,9 @@ static esp_err_t on_event(esp_http_client_event_t *ev) {
 esp_err_t kid_net_post_ogg(const uint8_t *ogg, size_t ogg_len, kid_resp_t *out) {
     memset(out, 0, sizeof(*out));
     // v0.1.12：直接复用启动期常驻缓冲，本轮 POST 不再有任何大块堆分配。
-    net_ctx_t c = { .resp = out, .buf = s_rx_buf, .len = 0, .cap = s_rx_cap };
+    // v0.1.13：录音也可能直接写进这块缓冲（省掉上行 60KB 的增长峰值）。
+    net_ctx_t c = { .resp = out, .buf = s_rx_buf, .len = 0, .cap = s_rx_cap,
+                    .tx_in_pool = (s_rx_buf && ogg == (const uint8_t *)s_rx_buf) };
 
     esp_http_client_config_t cfg = {
         .url = KID_ENDPOINT,
