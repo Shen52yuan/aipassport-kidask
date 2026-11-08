@@ -89,6 +89,5 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 # mbedtls_ssl_handshake 返回 -0x2700(证书校验失败) 或请求体发不出去(nginx 侧
 # 499/408)，同一固件"有时通、有时不通"。
 # 因此：显式关闭 TLS 1.3(TLS 1.3 的握手/密钥调度比 1.2 多占数 KB 连续内存，
-# 服务端 nginx 默认也支持 1.2)与会话票据缓存，把余量留给必需路径。
+# 服务端 nginx 默认也支持 1.2)。
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=n
-CONFIG_MBEDTLS_SSL_SESSION_TICKETS=n
