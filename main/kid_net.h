@@ -33,6 +33,10 @@ typedef struct {
        此时 audio 是童声引导提示音而非答案，播完回待机等待孩子按 OK 补充。 */
     bool     need_retry;
     char     retry_reason[24];        /* no_speech/hallucination/too_short/incomplete */
+    /* v0.1.14：连接/TLS 层就失败了（一个字节的 HTTP 响应都没拿到）。
+       上层据此区分「网络没连上」与「连上了但没音频」，不必自己 include
+       esp_http_client.h 去比对 ESP_ERR_HTTP_CONNECT。 */
+    bool     conn_failed;
 } kid_resp_t;
 
 /* v0.1.9：开机调用一次，生成本次开机的会话 id。之后每轮 POST 都带 X-Session-Id，
