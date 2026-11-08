@@ -10,15 +10,21 @@
 // 单个 Opus 数据包重组缓冲上限。上行封装单页 ≤ 4KB，故单个包不会超过此值。
 #define REASM_CAP 8192
 
+// v0.1.11：8KB 重组缓冲改静态。它经历过两次迁移：
+//   · 最早是栈数组，单项就吃掉整个 app 任务栈 → 播放回答时 Stack protection fault
+//     （v0.1.2 实机，见 MEMORY 红线）；
+//   · 改成堆分配后，连续多轮问答使堆碎片化，malloc(8192) 偶发失败 → 本函数返回
+//     OGG_DEMUX_ERR → 设备显示「声音没放出来」（2026-11-08 实机）。
+// 静态区在启动期即确定存在，不参与运行期堆碎片。全设备只有一个 app 任务串行调用
+// 本函数（录音与播放不会并发），无需加锁。
+static uint8_t s_reasm[REASM_CAP];
+
 ogg_demux_ret_t ogg_demux_parse(const uint8_t *buf, int len, void *user,
                                 void (*on_head)(void *user, uint32_t rate, int channels, int preskip),
                                 void (*on_packet)(void *user, const uint8_t *data, int plen)) {
     if (len < 0) return OGG_DEMUX_ERR;
 
-    // 8KB 重组缓冲放堆上：它原本是栈数组，单这一项就等于整个 app 任务栈额度，
-    // 播放回答时必然触发 Stack protection fault（v0.1.2 实测）。
-    uint8_t *reasm = (uint8_t *)malloc(REASM_CAP);
-    if (!reasm) return OGG_DEMUX_ERR;
+    uint8_t *reasm = s_reasm;
     ogg_demux_ret_t ret = OGG_DEMUX_OK;
 
     int reasm_len = 0;
@@ -77,6 +83,6 @@ ogg_demux_ret_t ogg_demux_parse(const uint8_t *buf, int len, void *user,
     (void)reasm_len;  // 末尾若仍有未结束的跨页包，说明流截断，忽略。
 
 done:
-    free(reasm);
+    // s_reasm 是静态缓冲，不可 free。
     return ret;
 }
