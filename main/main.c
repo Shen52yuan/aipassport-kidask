@@ -326,6 +326,14 @@ static void free_ogg(uint8_t *p) {
 static void run_ask(void) {
     ESP_LOGI(TAG, "开始问答: 按 OK 开录 → 再按 OK 发送 → 上传 → 播放");
     LOG_MEM("ask_start");
+    // v0.1.14：录音到一半才发现 Wi-Fi 掉了，等于让孩子白说一遍。开录前先确认链路；
+    // 这里不做阻塞重连（ensure_wifi 会死等用户长按 OK），直接回主循环由顶部重连。
+    if (!app_wifi_is_connected()) {
+        ESP_LOGW(TAG, "问答前 Wi-Fi 未连接，回到主循环重连");
+        app_ui_toast("网络断了，等一下再问");
+        flush_keys();
+        return;
+    }
     app_ui_set_state(KID_UI_RECORD, NULL);
     s_record_stop   = false;
     s_record_cancel = false;
@@ -439,12 +447,16 @@ static void run_ask(void) {
         const int st = resp.status;
         const size_t rx_len = resp.audio_len;
         kid_resp_free(&resp);
+        /* v0.1.14：连接级失败 = 连 TLS 都没握上手（实机日志 -0x2700 / ESP_ERR_HTTP_CONNECT）。
+           这时重发只是把 20s 超时再走一遍 —— 孩子盯着屏幕干等 40s，最后仍失败。
+           直接给「网络没连上」，把时间还给孩子重试。 */
+        const bool conn_fail = (st == 0 && pe == ESP_ERR_HTTP_CONNECT);
         // v0.1.12：只有「几乎没收到 body」才重发。收到大半但不能播的情况交给上面
         // 的 usable 分支播已收部分，不再白白多跑一次 ASR+LLM+TTS。
         // v0.1.13：录音写在共享池里，一旦响应体动过池子，重发就会把被覆盖的垃圾
         // 当录音再 POST 一次（服务端只会再答一遍错问题）。只有「一个字节都没收到」
         // 才允许重发 —— 那时池里仍是完整的上行 Ogg。
-        if (attempt == 0 && (st == 200 || st == 0) && !ogg_magic && rx_len == 0) {
+        if (attempt == 0 && !conn_fail && (st == 200 || st == 0) && !ogg_magic && rx_len == 0) {
             ESP_LOGW(TAG, "下行音频缺失，0.5s 后自动重发一次");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
@@ -453,7 +465,11 @@ static void run_ask(void) {
         free_ogg(ogg);
         // 文案消歧：这里说的是**服务器返回的回答音频**，不是孩子说的话。
         // 旧文案「声音没收到」让家长误以为设备没录到提问（2026-11-08 实机反馈）。
-        if (st == 0 || st == 200) {
+        if (conn_fail) {
+            // 连不上服务器（TLS/连接层失败）和「连上了但没音频」是两种事，
+            // 对孩子来说处置也不同：前者等一下网络，后者直接再问。
+            show_error("网络没连上，等一下再问");
+        } else if (st == 0 || st == 200) {
             show_error("回答没收到，按 OK 再问一次");
         } else if (st == 422) {
             show_error("再说一次好吗");
