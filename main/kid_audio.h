@@ -27,6 +27,14 @@
 esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
                                bool (*should_stop)(void), void (*on_level)(int));
 
+// v0.1.13：把 Ogg 直接封装进调用方给的**固定容量**缓冲（通常就是 kid_net 的共享池）。
+// 旧实现用「翻倍扩容」，10s 录音约 30KB 数据会要求 60KB 连续堆峰值；C3 无 PSRAM，
+// v0.1.12 又把 64KB 挪去常驻，堆不够时编码器创建失败 → 屏幕「录音出问题了」。
+// 写满时正常收尾（尽量补 eos 页）并返回 ESP_OK，不当作错误。
+// 成功时 *out_len 为字节数；缓冲不动（所有权仍属调用方）。
+esp_err_t kid_audio_record_ogg_to(uint8_t *buf, size_t cap, size_t *out_len,
+                                  bool (*should_stop)(void), void (*on_level)(int));
+
 // Ogg Opus → Opus 解码 → I2S 直放。阻塞直到播完或出错。
 // 解码目标采样率跟随 Ogg OpusHead（服务器约定 16k），与原 QCA 的 24k→16k 重采样说再见。
 esp_err_t kid_audio_play_ogg(const uint8_t *ogg, size_t len);
