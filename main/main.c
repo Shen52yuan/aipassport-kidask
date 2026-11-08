@@ -446,11 +446,11 @@ static void run_ask(void) {
 
         const int st = resp.status;
         const size_t rx_len = resp.audio_len;
+        const bool conn_fail = (st == 0 && resp.conn_failed);
         kid_resp_free(&resp);
         /* v0.1.14：连接级失败 = 连 TLS 都没握上手（实机日志 -0x2700 / ESP_ERR_HTTP_CONNECT）。
            这时重发只是把 20s 超时再走一遍 —— 孩子盯着屏幕干等 40s，最后仍失败。
            直接给「网络没连上」，把时间还给孩子重试。 */
-        const bool conn_fail = (st == 0 && pe == ESP_ERR_HTTP_CONNECT);
         // v0.1.12：只有「几乎没收到 body」才重发。收到大半但不能播的情况交给上面
         // 的 usable 分支播已收部分，不再白白多跑一次 ASR+LLM+TTS。
         // v0.1.13：录音写在共享池里，一旦响应体动过池子，重发就会把被覆盖的垃圾
