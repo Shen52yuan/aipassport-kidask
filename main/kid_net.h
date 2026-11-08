@@ -19,6 +19,10 @@ typedef struct {
     size_t   asr_len;
     uint8_t *audio;         /* Ogg Opus 音频主体（堆分配，需 kid_resp_free 释放） */
     size_t   audio_len;
+    /* v0.1.10：响应 Content-Length（0 表示未知/chunked）。上层据此判断音频是否
+       收全；旧版在 esp_http_client_perform 返回非 OK 时直接丢掉已收 body，
+       造成「服务端 200 且答案文案到位、设备却无音频可播」的静默失败。 */
+    size_t   content_len;
     /* v0.1.9 / 服务端 v0.2.0：X-Need-Retry: 1 表示「没听清 / 问题不完整」，
        此时 audio 是童声引导提示音而非答案，播完回待机等待孩子按 OK 补充。 */
     bool     need_retry;
