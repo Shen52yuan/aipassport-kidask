@@ -45,15 +45,20 @@ static int16_t s_play_pcm[PLAY_PCM_CAP];
 
 // ---------------------------------------------------------------------------
 // 可增长的输出缓冲：逐页追加 Ogg 页，避免一次性缓存全部裸 Opus 包（太占内存）。
+// v0.1.13：支持「固定容量」模式 —— 上层传入常驻共享池时不 realloc。
+// 旧实现一律翻倍扩容，30KB 音频要 60KB 连续堆峰值；C3 无 PSRAM 时直接爆。
 // ---------------------------------------------------------------------------
 typedef struct {
     uint8_t *p;
     size_t   len;
     size_t   cap;
+    bool     fixed;    // 外部固定缓冲：写满即止，绝不 realloc
+    bool     full;     // 固定模式下已写满
 } grow_t;
 
 static bool grow_append(grow_t *g, const uint8_t *d, size_t n) {
     if (g->len + n > g->cap) {
+        if (g->fixed) { g->full = true; return false; }
         size_t nc = (g->len + n) * 2 + 256;
         uint8_t *np = realloc(g->p, nc);
         if (!np) return false;
@@ -89,8 +94,27 @@ typedef struct {
     uint8_t  hdr[192];      // 头部两页（BOS OpusHead + OpusTags）合计约 115 字节
 } rec_ws_t;
 
+// fixed_buf != NULL 时走固定容量模式（不 realloc、写满即收尾）。
+static esp_err_t kid_audio_record_impl(uint8_t *fixed_buf, size_t fixed_cap,
+                                       uint8_t **out_ogg, size_t *out_len,
+                                       bool (*should_stop)(void), void (*on_level)(int));
+
 esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
                                bool (*should_stop)(void), void (*on_level)(int)) {
+    return kid_audio_record_impl(NULL, 0, out_ogg, out_len, should_stop, on_level);
+}
+
+esp_err_t kid_audio_record_ogg_to(uint8_t *buf, size_t cap, size_t *out_len,
+                                  bool (*should_stop)(void), void (*on_level)(int)) {
+    if (!buf || cap < 2048) return ESP_ERR_INVALID_ARG;
+    uint8_t *unused = NULL;
+    return kid_audio_record_impl(buf, cap, &unused, out_len, should_stop, on_level);
+}
+
+// fixed_buf != NULL 时走固定容量模式（不 realloc、写满即收尾）。
+static esp_err_t kid_audio_record_impl(uint8_t *fixed_buf, size_t fixed_cap,
+                                       uint8_t **out_ogg, size_t *out_len,
+                                       bool (*should_stop)(void), void (*on_level)(int)) {
     *out_ogg = NULL;
     *out_len = 0;
 
@@ -102,8 +126,16 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
 
     ESP_LOGI(TAG, "创建 Opus 编码器 ...");
     kid_encoder_t enc = kid_encoder_create(KID_OPUS_BITRATE);
-    if (!enc) return ESP_FAIL;
-    ESP_LOGI(TAG, "Opus 编码器就绪，进入录音循环");
+    if (!enc) {
+        // 这条日志在 v0.1.12 实机上出现过：常驻缓冲吃掉 64KB 后堆只剩 18KB，
+        // 编码器（十几 KB 连续块）创建失败 → 屏幕「录音出问题了」。
+        ESP_LOGE(TAG, "Opus 编码器创建失败（剩余堆=%u 最大连续块=%u）",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Opus 编码器就绪（剩余堆=%u），进入录音循环",
+             (unsigned)esp_get_free_heap_size());
 
     rec_ws_t *w = (rec_ws_t *)calloc(1, sizeof(*w));
     if (!w) {
@@ -115,6 +147,12 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
     ogg_mux_t m, m_before_pending = {0};
     ogg_mux_init(&m, esp_random());
     grow_t g = {0};
+    if (fixed_buf) {
+        // v0.1.13：直接写调用方的常驻池，全程零 realloc。
+        g.p = fixed_buf;
+        g.cap = fixed_cap;
+        g.fixed = true;
+    }
     int    pending_page_len = 0;
     int    pending_pkt_len  = 0;
     const int per_pkt_samples = FRAME_SAMPLES * 3;   // 16k → 48k 粒度增量
@@ -128,6 +166,7 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
 
     const int64_t t0 = esp_timer_get_time();
     int64_t stop_at = 0;
+    bool    buf_full = false;
 
     for (;;) {
         // v0.1.9：松手后不立即收尾，再录 KID_REC_TAIL_MS。儿童常拖长尾音，
@@ -154,6 +193,12 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
         // 上一页已封装完成（eos=false），先落盘。
         if (pending_page_len > 0 &&
             !grow_append(&g, w->pending_page, (size_t)pending_page_len)) {
+            if (g.fixed) {
+                // 固定池写满：正常收尾（丢最后一页尾音），绝不当成录音失败。
+                ESP_LOGW(TAG, "上行缓冲写满(%uB)，提前收尾", (unsigned)g.cap);
+                buf_full = true;
+                break;
+            }
             ret = ESP_ERR_NO_MEM;
             goto done;
         }
@@ -176,28 +221,39 @@ esp_err_t kid_audio_record_ogg(uint8_t **out_ogg, size_t *out_len,
     }
 
     // 结尾：用快照重建最后一页并置 eos（重新计算 CRC，保证合法）。
-    m = m_before_pending;
-    int pn = ogg_mux_data_page(&m, w->pending_pkt, pending_pkt_len, true, per_pkt_samples,
-                               w->page, sizeof(w->page));
-    if (pn < 0 || !grow_append(&g, w->page, (size_t)pn)) {
-        ret = ESP_ERR_NO_MEM;
-        goto done;
+    // 固定池写满时没有余量，跳过 eos：缺 eos 的 Ogg 仍是合法可解码流，
+    // 服务端 ffmpeg 照常解出音频，比丢掉整段录音强得多。
+    if (!buf_full) {
+        m = m_before_pending;
+        int pn = ogg_mux_data_page(&m, w->pending_pkt, pending_pkt_len, true,
+                                   per_pkt_samples, w->page, sizeof(w->page));
+        if (pn < 0 || !grow_append(&g, w->page, (size_t)pn)) {
+            if (!g.fixed) { ret = ESP_ERR_NO_MEM; goto done; }
+            ESP_LOGW(TAG, "尾部 eos 页放不下，按无 eos 流交付");
+        }
     }
 
-    // grow_append 按 2 倍扩容，交付前收缩到实际长度，避免上行期间白占一倍堆。
-    uint8_t *tight = (uint8_t *)realloc(g.p, g.len);
-    if (tight) g.p = tight;
-
-    *out_ogg = g.p;
-    *out_len = g.len;
-    g.p = NULL;                       // 所有权移交调用方
-    ESP_LOGI(TAG, "录音完成: %lldms, Ogg %u 字节", (long long)dur_ms, (unsigned)g.len);
+    if (fixed_buf) {
+        // 固定池：缓冲所有权属于调用方，只回报长度。
+        *out_len = g.len;
+        ESP_LOGI(TAG, "录音完成: %lldms, Ogg %u 字节（写共享池 %u/%u，满=%d）",
+                 (long long)dur_ms, (unsigned)g.len, (unsigned)g.len,
+                 (unsigned)g.cap, buf_full ? 1 : 0);
+    } else {
+        // 动态模式：扩容按 2 倍走，交付前收缩到实际长度，避免上行期间白占一倍堆。
+        uint8_t *tight = (uint8_t *)realloc(g.p, g.len);
+        if (tight) g.p = tight;
+        *out_ogg = g.p;
+        *out_len = g.len;
+        g.p = NULL;                       // 所有权移交调用方
+        ESP_LOGI(TAG, "录音完成: %lldms, Ogg %u 字节", (long long)dur_ms, (unsigned)g.len);
+    }
     ret = ESP_OK;
 
 done:
     kid_encoder_destroy(enc);
     free(w);
-    free(g.p);
+    if (!fixed_buf) free(g.p);   // 固定池属调用方，禁止释放（否则下次录音写野指针）
     return ret;
 }
 
