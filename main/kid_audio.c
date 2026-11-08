@@ -25,8 +25,10 @@ static const char *TAG = "kid_audio";
 #define FRAME_BYTES   (FRAME_SAMPLES * 2)
 
 // v0.1.9 录音留白：儿童说话尾音常被松手瞬间切掉，按键机械声又会混进首帧。
-// 起录丢弃前 150ms、松手后补采 250ms，实测能明显减少「尾字丢失→ASR 幻觉」。
-#define KID_REC_LEADIN_MS  150
+// v0.1.10：改成「按一下开录 / 再按一下发送」后，开录动作由完整短按 CLICK 触发，
+// 此时按键声早已过去，前导只需滤掉 codec 刚 open 的直流瞬态；留 150ms 反而会
+// 吃掉孩子开口的第一个字。收尾仍补采 250ms 保护拖长的尾音。
+#define KID_REC_LEADIN_MS  60
 #define KID_REC_TAIL_MS    250
 
 // 容纳一页封装结果（最大包 ≤1275 字节 + Ogg 页头 ≤64 字节，留足余量）。
